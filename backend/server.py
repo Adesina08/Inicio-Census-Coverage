@@ -444,13 +444,17 @@ def _tile_pixel_coordinates(
 
 def _tile_bucket_size(z_value: int) -> int:
     if z_value <= 5:
+        return 256
+    if z_value <= 6:
         return 192
     if z_value <= 7:
-        return 128
+        return 144
     if z_value <= 8:
-        return 96
+        return 112
     if z_value <= 9:
-        return 64
+        return 80
+    if z_value <= 10:
+        return 56
     return 0
 
 
@@ -1587,11 +1591,13 @@ def fetch_map_tile(
 
     try:
         params: list[Any] = [west, east, south, north]
+        point_table_name = "gps_events_deduped" if z_value <= 8 else "gps_events_clean"
         filters = [
             "points.longitude between ? and ?",
             "points.latitude between ? and ?",
             "points.gps_quality_flag not in ('missing', 'invalid', 'outside_nigeria')",
         ]
+        from_clause = f"from {point_table_name} as points"
 
         if state_name and state_name != "all":
             filters.append("points.state_name = ?")
@@ -1602,6 +1608,12 @@ def fetch_map_tile(
             params.append(lga_name)
 
         if coverage_status and coverage_status != "all":
+            from_clause += """
+            left join ward_coverage_summary as coverage
+              on points.state_name = coverage.state_name
+             and points.lga_name = coverage.lga_name
+             and points.ward_name = coverage.ward_name
+            """
             filters.append("coverage.coverage_status = ?")
             params.append(coverage_status)
 
@@ -1613,11 +1625,7 @@ def fetch_map_tile(
               points.visit_status,
               points.latitude,
               points.longitude
-            from gps_events_clean as points
-            left join ward_coverage_summary as coverage
-              on points.state_name = coverage.state_name
-             and points.lga_name = coverage.lga_name
-             and points.ward_name = coverage.ward_name
+            {from_clause}
             where {where_clause}
             """,
             params,

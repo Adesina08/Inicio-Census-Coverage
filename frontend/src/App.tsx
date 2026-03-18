@@ -1510,6 +1510,13 @@ export default function App() {
         ? dashboard?.wardByKey.get(selectedWardKey) ?? null
         : null
     : wardsWithGps[0] ?? coverageScopedWards[0] ?? null
+  const activeWardAnalysisPoints = useMemo(
+    () =>
+      activeWard
+        ? analysisScopePoints.filter((feature) => feature.properties.wardKey === activeWard.properties.wardKey)
+        : [],
+    [activeWard, analysisScopePoints],
+  )
 
   const selectedStateFeature =
     selectedState === 'all' ? null : dashboard?.stateByName.get(selectedState) ?? null
@@ -2075,6 +2082,20 @@ export default function App() {
       return
     }
 
+    if (activeWardAnalysisPoints.length > 0) {
+      startTransition(() => {
+        setMapPoints(activeWardAnalysisPoints)
+        setIsMapPointsLoading(false)
+      })
+      return
+    }
+
+    if (activeWard.properties.rawObservationCount <= 0) {
+      setMapPoints([])
+      setIsMapPointsLoading(false)
+      return
+    }
+
     const detailBounds = getFeatureBounds(activeWard)
     if (!detailBounds) {
       setMapPoints([])
@@ -2120,7 +2141,7 @@ export default function App() {
       ignore = true
       window.clearTimeout(timeoutId)
     }
-  }, [activeWard, dashboard, focusMode])
+  }, [activeWard, activeWardAnalysisPoints, dashboard, focusMode])
 
   if ((!dashboard || showStartupLoading) && !loadError) {
     return (
