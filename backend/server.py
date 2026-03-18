@@ -238,6 +238,8 @@ class DashboardStore:
 STORE = DashboardStore()
 OUTLET_ANALYSIS_CACHE_LOCK = Lock()
 OUTLET_ANALYSIS_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
+DUCKDB_TEMP_DIRECTORY_LOCK = Lock()
+ACTIVE_DUCKDB_TEMP_DIRECTORY: str | None = None
 PRODUCT_CATEGORY_ITEMS = sorted(
     builder.PRODUCT_CATEGORY_LABELS.items(),
     key=lambda item: int(item[0]),
@@ -654,6 +656,8 @@ def configure_duckdb_connection(
     connection: duckdb.DuckDBPyConnection,
     descriptor: DatasetDescriptor,
 ) -> None:
+    global ACTIVE_DUCKDB_TEMP_DIRECTORY
+
     temp_directory = Path(
         os.environ.get(
             "DUCKDB_TEMP_DIRECTORY",
@@ -661,6 +665,7 @@ def configure_duckdb_connection(
         )
     )
     temp_directory.mkdir(parents=True, exist_ok=True)
+    temp_directory_text = str(temp_directory.resolve())
 
     memory_limit = os.environ.get("DUCKDB_MEMORY_LIMIT", "256MB")
     max_temp_directory_size = os.environ.get(
@@ -669,7 +674,11 @@ def configure_duckdb_connection(
     )
     threads = os.environ.get("DUCKDB_THREADS", "1")
 
-    connection.execute(f"SET temp_directory={_sql_string_literal(str(temp_directory))}")
+    with DUCKDB_TEMP_DIRECTORY_LOCK:
+        if ACTIVE_DUCKDB_TEMP_DIRECTORY != temp_directory_text:
+            connection.execute(f"SET temp_directory={_sql_string_literal(temp_directory_text)}")
+            ACTIVE_DUCKDB_TEMP_DIRECTORY = temp_directory_text
+
     connection.execute(
         f"SET max_temp_directory_size={_sql_string_literal(max_temp_directory_size)}"
     )
