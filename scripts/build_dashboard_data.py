@@ -4,8 +4,10 @@ import json
 import math
 import re
 import shutil
+import csv
 from collections import Counter, defaultdict
 from datetime import date, datetime
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +29,7 @@ OUTPUT_FILENAMES = {
     "wards": "ward-boundaries.geojson",
     "observations": "gps-observations.geojson",
     "summary": "dashboard-summary.json",
+    "outlet_analysis": "outlet-analysis.json",
 }
 LEGACY_OUTPUT_PATHS = {
     name: PUBLIC_DATA_DIR / filename for name, filename in OUTPUT_FILENAMES.items()
@@ -41,6 +44,7 @@ NEAR_TARGET_PERCENT = 80
 WELL_COVERED_PERCENT = 85
 MAX_FRONTEND_OBSERVATIONS = 50_000
 RUNTIME_SCHEMA_VERSION = 7
+SUBCATEGORY_MAPPING_CSV_PATH = Path.home() / "Downloads" / "Categories_Subcat_PROPER.csv"
 
 PRODUCT_CATEGORY_LABELS = {
     "1": "Baby food",
@@ -693,6 +697,241 @@ def parse_multi_select_codes(value: Any) -> list[str]:
 
 def broad_category_labels(value: Any) -> list[str]:
     return [PRODUCT_CATEGORY_LABELS.get(code, code) for code in parse_multi_select_codes(value)]
+
+
+def normalize_subcategory_mapping_value(value: str) -> str:
+    normalized = value.strip().lower()
+    normalized = re.sub(r"\s+category$", "", normalized)
+    normalized = re.sub(r"[^a-z0-9]+", "", normalized)
+    return normalized
+
+
+@lru_cache(maxsize=1)
+def load_subcategory_proper_labels() -> dict[tuple[str, str], str]:
+    if not SUBCATEGORY_MAPPING_CSV_PATH.exists():
+        return {}
+
+    mapping: dict[tuple[str, str], str] = {}
+    with SUBCATEGORY_MAPPING_CSV_PATH.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            category_name = (row.get("product_category") or "").strip()
+            raw_subcategory_name = (row.get("product_sub_category") or "").strip()
+            proper_subcategory_name = (row.get("product_sub_category_PROPER") or "").strip()
+            if not category_name or not raw_subcategory_name or not proper_subcategory_name:
+                continue
+
+            mapping[
+                (
+                    normalize_subcategory_mapping_value(category_name),
+                    normalize_subcategory_mapping_value(raw_subcategory_name),
+                )
+            ] = proper_subcategory_name
+
+    return mapping
+
+
+def build_default_outlet_analysis_payload(connection: duckdb.DuckDBPyConnection) -> dict[str, Any]:
+    proper_labels = load_subcategory_proper_labels()
+    subcategory_columns_sql = ",\n          ".join(
+        str(definition["fieldAlias"]) for definition in OUTLET_SUBCATEGORY_GROUPS
+    )
+    rows = connection.execute(
+        f"""
+        select
+          state_name,
+          lga_name,
+          ward_name,
+          outlet_type,
+          product_category_codes_raw,
+          visit_status,
+          {subcategory_columns_sql}
+        from gps_events_clean
+        """
+    ).fetchall()
+
+    state_options = sorted(
+        {
+            str(state_name).strip()
+            for state_name, *_ in rows
+            if state_name is not None and str(state_name).strip()
+        }
+    )
+    lga_options = sorted(
+        {
+            str(lga_name).strip()
+            for _, lga_name, *_ in rows
+            if lga_name is not None and str(lga_name).strip()
+        }
+    )
+    category_options = [PRODUCT_CATEGORY_LABELS[code] for code in PRODUCT_CATEGORY_LABELS]
+    scope_record_count = len(rows)
+
+    outlet_type_counts: Counter[str] = Counter()
+    outlet_type_completed: Counter[str] = Counter()
+    outlet_type_observation: Counter[str] = Counter()
+    outlet_type_states: dict[str, set[str]] = {}
+    outlet_type_lgas: dict[str, set[str]] = {}
+    outlet_type_wards: dict[str, set[str]] = {}
+    categories_by_outlet_type: dict[str, Counter[str]] = {}
+
+    category_counts: Counter[str] = Counter()
+    category_completed: Counter[str] = Counter()
+    category_observation: Counter[str] = Counter()
+    category_states: dict[str, set[str]] = {}
+    category_lgas: dict[str, set[str]] = {}
+    category_wards: dict[str, set[str]] = {}
+
+    subcategory_counts: Counter[tuple[str, str]] = Counter()
+    subcategory_completed: Counter[tuple[str, str]] = Counter()
+    subcategory_observation: Counter[tuple[str, str]] = Counter()
+    subcategory_states: dict[tuple[str, str], set[str]] = {}
+    subcategory_lgas: dict[tuple[str, str], set[str]] = {}
+    subcategory_wards: dict[tuple[str, str], set[str]] = {}
+
+    for row in rows:
+        (
+            state_name,
+            lga_name,
+            ward_name,
+            outlet_type,
+            product_category_codes_raw,
+            visit_status,
+            *subcategory_values,
+        ) = row
+        normalized_state = (state_name or "").strip()
+        normalized_lga = (lga_name or "").strip()
+        normalized_ward = (ward_name or "").strip()
+        normalized_outlet_type = (outlet_type or "").strip() or "Unknown"
+        ward_key = build_ward_key(normalized_state, normalized_lga, normalized_ward)
+
+        outlet_type_counts[normalized_outlet_type] += 1
+        outlet_type_states.setdefault(normalized_outlet_type, set()).add(normalized_state)
+        outlet_type_lgas.setdefault(normalized_outlet_type, set()).add(
+            build_lga_key(normalized_state, normalized_lga)
+        )
+        outlet_type_wards.setdefault(normalized_outlet_type, set()).add(ward_key)
+        if visit_status == "Completed":
+            outlet_type_completed[normalized_outlet_type] += 1
+        elif visit_status == "Observation":
+            outlet_type_observation[normalized_outlet_type] += 1
+
+        category_codes = parse_multi_select_codes(product_category_codes_raw)
+        if not category_codes:
+            category_labels = ["No category recorded"]
+        else:
+            category_labels = [PRODUCT_CATEGORY_LABELS.get(code, code) for code in category_codes]
+
+        for category_label in category_labels:
+            categories_by_outlet_type.setdefault(normalized_outlet_type, Counter())[category_label] += 1
+            category_counts[category_label] += 1
+            category_states.setdefault(category_label, set()).add(normalized_state)
+            category_lgas.setdefault(category_label, set()).add(
+                build_lga_key(normalized_state, normalized_lga)
+            )
+            category_wards.setdefault(category_label, set()).add(ward_key)
+            if visit_status == "Completed":
+                category_completed[category_label] += 1
+            elif visit_status == "Observation":
+                category_observation[category_label] += 1
+
+        for definition, raw_subcategory_value in zip(OUTLET_SUBCATEGORY_GROUPS, subcategory_values):
+            category_name = str(definition["categoryLabel"])
+            raw_codes = parse_multi_select_codes(raw_subcategory_value)
+            if not raw_codes:
+                continue
+            known_labels = {str(code): str(label) for code, label in dict(definition["knownLabels"]).items()}
+            for code in raw_codes:
+                raw_label = known_labels.get(code, f"{category_name} option {code}")
+                proper_label = proper_labels.get(
+                    (
+                        normalize_subcategory_mapping_value(category_name),
+                        normalize_subcategory_mapping_value(raw_label),
+                    ),
+                    raw_label,
+                )
+                key = (category_name, proper_label)
+                subcategory_counts[key] += 1
+                subcategory_states.setdefault(key, set()).add(normalized_state)
+                subcategory_lgas.setdefault(key, set()).add(
+                    build_lga_key(normalized_state, normalized_lga)
+                )
+                subcategory_wards.setdefault(key, set()).add(ward_key)
+                if visit_status == "Completed":
+                    subcategory_completed[key] += 1
+                elif visit_status == "Observation":
+                    subcategory_observation[key] += 1
+
+    outlet_type_rows = []
+    for outlet_type_name, record_count in sorted(
+        outlet_type_counts.items(), key=lambda item: (-item[1], item[0])
+    ):
+        category_counts_for_outlet = categories_by_outlet_type.get(outlet_type_name, Counter())
+        categories_summary = ", ".join(
+            f"{category_label} ({count})"
+            for category_label, count in sorted(
+                category_counts_for_outlet.items(), key=lambda item: (-item[1], item[0])
+            )
+        )
+        outlet_type_rows.append(
+            {
+                "outletType": outlet_type_name,
+                "count": int(record_count),
+                "completedCount": int(outlet_type_completed.get(outlet_type_name, 0)),
+                "observationCount": int(outlet_type_observation.get(outlet_type_name, 0)),
+                "sharePercent": 0 if scope_record_count == 0 else (record_count / scope_record_count) * 100,
+                "stateCount": len(outlet_type_states.get(outlet_type_name, set())),
+                "lgaCount": len(outlet_type_lgas.get(outlet_type_name, set())),
+                "wardCount": len(outlet_type_wards.get(outlet_type_name, set())),
+                "distinctCategoryCount": len(category_counts_for_outlet),
+                "categoriesSummary": categories_summary,
+            }
+        )
+
+    outlet_category_rows = []
+    for category_name, record_count in sorted(category_counts.items(), key=lambda item: (-item[1], item[0])):
+        outlet_category_rows.append(
+            {
+                "categoryName": category_name,
+                "count": int(record_count),
+                "completedCount": int(category_completed.get(category_name, 0)),
+                "observationCount": int(category_observation.get(category_name, 0)),
+                "sharePercent": 0 if scope_record_count == 0 else (record_count / scope_record_count) * 100,
+                "stateCount": len(category_states.get(category_name, set())),
+                "lgaCount": len(category_lgas.get(category_name, set())),
+                "wardCount": len(category_wards.get(category_name, set())),
+            }
+        )
+
+    outlet_subcategory_rows = []
+    for (category_name, subcategory_name), record_count in sorted(
+        subcategory_counts.items(), key=lambda item: (-item[1], item[0][0], item[0][1])
+    ):
+        key = (category_name, subcategory_name)
+        outlet_subcategory_rows.append(
+            {
+                "categoryName": category_name,
+                "subcategoryName": subcategory_name,
+                "count": int(record_count),
+                "completedCount": int(subcategory_completed.get(key, 0)),
+                "observationCount": int(subcategory_observation.get(key, 0)),
+                "sharePercent": 0 if scope_record_count == 0 else (record_count / scope_record_count) * 100,
+                "stateCount": len(subcategory_states.get(key, set())),
+                "lgaCount": len(subcategory_lgas.get(key, set())),
+                "wardCount": len(subcategory_wards.get(key, set())),
+            }
+        )
+
+    return {
+        "stateOptions": state_options,
+        "lgaOptions": lga_options,
+        "categoryOptions": category_options,
+        "scopeRecordCount": scope_record_count,
+        "filteredRecordCount": scope_record_count,
+        "outletTypeRows": outlet_type_rows,
+        "outletCategoryRows": outlet_category_rows,
+        "outletSubcategoryRows": outlet_subcategory_rows,
+    }
 
 
 def sample_evenly(items: list[Any], max_items: int) -> list[Any]:
@@ -1787,12 +2026,14 @@ def prepare_dataset_bundle(
             observations_geojson,
             valid_gps_count,
         )
+        outlet_analysis_payload = build_default_outlet_analysis_payload(connection)
 
         write_json(output_paths["states"], state_geojson)
         write_json(output_paths["lgas"], lga_geojson)
         write_json(output_paths["wards"], ward_geojson)
         write_json(output_paths["observations"], observations_geojson)
         write_json(output_paths["summary"], dashboard_summary)
+        write_json(output_paths["outlet_analysis"], outlet_analysis_payload)
 
         clean_count = connection.execute(
             "select count(*) from gps_events_clean where latitude is not null and longitude is not null and gps_quality_flag not in ('missing', 'invalid', 'outside_nigeria')"
@@ -1815,6 +2056,7 @@ def prepare_dataset_bundle(
         print(f"Wrote {output_paths['wards'].relative_to(ROOT)}")
         print(f"Wrote {output_paths['observations'].relative_to(ROOT)}")
         print(f"Wrote {output_paths['summary'].relative_to(ROOT)}")
+        print(f"Wrote {output_paths['outlet_analysis'].relative_to(ROOT)}")
         print("Updated DuckDB tables: gps_events_clean, gps_events_deduped, ward_coverage_summary")
         print(f"Clean GPS events: {clean_count}")
         print(f"Deduped scoring events: {deduped_count}")

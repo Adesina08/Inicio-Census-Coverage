@@ -291,6 +291,20 @@ def load_prebuilt_observations_payload(
         return None
 
 
+def load_prebuilt_outlet_analysis_payload(
+    descriptor: DatasetDescriptor,
+) -> dict[str, Any] | None:
+    output_paths = builder.build_dataset_output_paths(descriptor.id)
+    outlet_analysis_path = output_paths["outlet_analysis"]
+    if not outlet_analysis_path.exists():
+        return None
+
+    try:
+        return json.loads(outlet_analysis_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
 def _normalize_subcategory_mapping_value(value: str) -> str:
     normalized = value.strip().lower()
     normalized = re.sub(r"\s+category$", "", normalized)
@@ -1043,6 +1057,19 @@ def fetch_outlet_analysis(
             }
         )
     )
+    is_default_scope = (
+        (not state_name or state_name == "all")
+        and (not lga_name or lga_name == "all")
+        and not ward_key
+        and (not category_name or category_name == "all")
+        and not normalized_outlet_types
+        and (not outlet_type or outlet_type == "all")
+    )
+    if is_default_scope:
+        prebuilt_payload = load_prebuilt_outlet_analysis_payload(descriptor)
+        if prebuilt_payload is not None:
+            return prebuilt_payload
+
     stat_result = descriptor.source_path.stat()
     cache_key = (
         descriptor.id,
