@@ -1934,9 +1934,9 @@ def main() -> None:
         or os.environ.get("PORT")
         or "8000"
     )
-    warm_primary_api_cache()
     server = ThreadingHTTPServer((host, port), ApiHandler)
     print(f"DuckDB dashboard API listening on http://{host}:{port}")
+    Thread(target=warm_primary_api_cache, daemon=True).start()
     Thread(target=warm_default_api_caches, daemon=True).start()
     try:
         server.serve_forever()
