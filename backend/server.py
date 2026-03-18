@@ -194,6 +194,10 @@ class DashboardStore:
             return observations_payload
 
     def _build_metrics_payload(self, descriptor: DatasetDescriptor) -> dict[str, Any]:
+        prebuilt_payload = load_prebuilt_metrics_payload(descriptor)
+        if prebuilt_payload is not None:
+            return prebuilt_payload
+
         connection = connect_with_runtime_tables(descriptor)
 
         try:
@@ -240,6 +244,31 @@ CATEGORY_CODE_BY_LABEL = {
 SUBCATEGORY_MAPPING_CSV_PATH = Path.home() / "Downloads" / "Categories_Subcat_PROPER.csv"
 CLIENT_DISCONNECT_WINERRORS = {10053, 10054}
 CLIENT_DISCONNECT_ERRNOS = {32, 104}
+
+
+def load_prebuilt_metrics_payload(
+    descriptor: DatasetDescriptor,
+) -> dict[str, Any] | None:
+    output_paths = builder.build_dataset_output_paths(descriptor.id)
+    required_paths = {
+        "states": output_paths["states"],
+        "lgas": output_paths["lgas"],
+        "wards": output_paths["wards"],
+        "summary": output_paths["summary"],
+    }
+
+    if not all(path.exists() for path in required_paths.values()):
+        return None
+
+    try:
+        return {
+            "states": json.loads(required_paths["states"].read_text(encoding="utf-8")),
+            "lgas": json.loads(required_paths["lgas"].read_text(encoding="utf-8")),
+            "wards": json.loads(required_paths["wards"].read_text(encoding="utf-8")),
+            "summary": json.loads(required_paths["summary"].read_text(encoding="utf-8")),
+        }
+    except (OSError, json.JSONDecodeError):
+        return None
 
 
 def _normalize_subcategory_mapping_value(value: str) -> str:
