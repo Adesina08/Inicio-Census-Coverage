@@ -14,11 +14,12 @@ from shapely.geometry import Point, shape
 from shapely.ops import unary_union
 
 ROOT = Path(__file__).resolve().parents[1]
-PUBLIC_DATA_DIR = ROOT / "public" / "data"
+DATA_DIR = ROOT / "data"
+PUBLIC_DATA_DIR = ROOT / "frontend" / "public" / "data"
 
-STATE_SOURCE_PATH = ROOT / "NGA_State_Boundaries.geojson"
-LGA_SOURCE_PATH = ROOT / "NGA_LGA_Boundaries.geojson"
-WARD_SOURCE_PATH = ROOT / "Nigeria_-_Ward_Boundaries.geojson"
+STATE_SOURCE_PATH = DATA_DIR / "NGA_State_Boundaries.geojson"
+LGA_SOURCE_PATH = DATA_DIR / "NGA_LGA_Boundaries.geojson"
+WARD_SOURCE_PATH = DATA_DIR / "Nigeria_-_Ward_Boundaries.geojson"
 
 OUTPUT_FILENAMES = {
     "states": "state-boundaries.geojson",
@@ -331,7 +332,7 @@ def build_dataset_id(source_path: Path, used_ids: set[str]) -> str:
 
 def discover_duckdb_sources() -> list[Path]:
     return sorted(
-        [path for path in ROOT.glob("*.duckdb") if path.is_file()],
+        [path for path in DATA_DIR.glob("*.duckdb") if path.is_file()],
         key=lambda path: (path.name.lower() != "census.duckdb", path.name.lower()),
     )
 

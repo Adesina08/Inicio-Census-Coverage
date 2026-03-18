@@ -4,6 +4,7 @@ import csv
 import gzip
 import json
 import math
+import mimetypes
 import os
 import re
 import sys
@@ -21,6 +22,7 @@ from urllib.parse import parse_qs, urlparse
 import duckdb
 
 ROOT = Path(__file__).resolve().parents[1]
+DIST_DIR = ROOT / "frontend" / "dist"
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
@@ -1738,10 +1740,14 @@ class ApiHandler(BaseHTTPRequestHandler):
                 )
                 return
 
-            self._send_json(
-                {"error": f"Unknown endpoint: {path}"},
-                status=HTTPStatus.NOT_FOUND,
-            )
+            if path.startswith("/api/"):
+                self._send_json(
+                    {"error": f"Unknown endpoint: {path}"},
+                    status=HTTPStatus.NOT_FOUND,
+                )
+                return
+
+            self._send_frontend(path)
         except FileNotFoundError as error:
             if is_client_disconnect_error(error):
                 return
@@ -1761,14 +1767,18 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.send_header("Cache-Control", "no-store")
         self.send_header("Connection", "close")
 
-    def _send_json(self, payload: dict[str, Any], status: HTTPStatus = HTTPStatus.OK) -> None:
+    def _send_json(
+        self,
+        payload: dict[str, Any],
+        status: HTTPStatus = HTTPStatus.OK,
+    ) -> None:
         body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         try:
             self.send_response(status)
             self._send_default_headers()
+            self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
@@ -1792,6 +1802,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         try:
             self.send_response(status)
             self._send_default_headers()
+            self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Type", content_type)
             if body is not payload:
                 self.send_header("Content-Encoding", "gzip")
@@ -1801,6 +1812,72 @@ class ApiHandler(BaseHTTPRequestHandler):
         except OSError as error:
             if not is_client_disconnect_error(error):
                 raise
+
+    def _send_file(
+        self,
+        file_path: Path,
+        *,
+        content_type: str,
+        status: HTTPStatus = HTTPStatus.OK,
+        cache_control: str = "no-store",
+    ) -> None:
+        body = file_path.read_bytes()
+        try:
+            self.send_response(status)
+            self._send_default_headers()
+            self.send_header("Cache-Control", cache_control)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except OSError as error:
+            if not is_client_disconnect_error(error):
+                raise
+
+    def _send_frontend(self, path: str) -> None:
+        if not DIST_DIR.exists():
+            self._send_json(
+                {"error": "Frontend build not found. Run `npm run build` before starting the server."},
+                status=HTTPStatus.NOT_FOUND,
+            )
+            return
+
+        requested_path = path.lstrip("/")
+        candidate = (DIST_DIR / requested_path).resolve()
+        dist_root = DIST_DIR.resolve()
+
+        if (
+            requested_path
+            and candidate.exists()
+            and candidate.is_file()
+            and (candidate == dist_root or dist_root in candidate.parents)
+        ):
+            content_type = mimetypes.guess_type(candidate.name)[0] or "application/octet-stream"
+            cache_control = (
+                "public, max-age=31536000, immutable"
+                if "/assets/" in candidate.as_posix() or candidate.parent.name == "assets"
+                else "no-store"
+            )
+            self._send_file(
+                candidate,
+                content_type=content_type,
+                cache_control=cache_control,
+            )
+            return
+
+        index_path = DIST_DIR / "index.html"
+        if not index_path.exists():
+            self._send_json(
+                {"error": "Frontend entrypoint not found. Run `npm run build` before starting the server."},
+                status=HTTPStatus.NOT_FOUND,
+            )
+            return
+
+        self._send_file(
+            index_path,
+            content_type="text/html; charset=utf-8",
+            cache_control="no-store",
+        )
 
 
 def warm_default_api_caches() -> None:
@@ -1852,7 +1929,11 @@ def warm_primary_api_cache() -> None:
 
 def main() -> None:
     host = os.environ.get("DUCKDB_DASHBOARD_HOST", "0.0.0.0")
-    port = int(os.environ.get("DUCKDB_DASHBOARD_PORT", "8000"))
+    port = int(
+        os.environ.get("DUCKDB_DASHBOARD_PORT")
+        or os.environ.get("PORT")
+        or "8000"
+    )
     warm_primary_api_cache()
     server = ThreadingHTTPServer((host, port), ApiHandler)
     print(f"DuckDB dashboard API listening on http://{host}:{port}")

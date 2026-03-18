@@ -7,8 +7,9 @@ from pathlib import Path
 import duckdb
 
 ROOT = Path(__file__).resolve().parents[1]
-PHASE1_DB_PATH = ROOT / "Census_Phase_1.duckdb"
-OUTPUT_PATH = ROOT / "phase1-category-subcategories.csv"
+DATA_DIR = ROOT / "data"
+PHASE1_DB_PATH = DATA_DIR / "Census_Phase_1.duckdb"
+OUTPUT_PATH = DATA_DIR / "phase1-category-subcategories.csv"
 
 
 CATEGORY_DEFINITIONS = [
