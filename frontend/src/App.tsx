@@ -776,6 +776,60 @@ export default function App() {
           return
         }
 
+        if (!isInitialLoad) {
+          if (cachedAnalysis) {
+            setAnalysisObservations(cachedAnalysis.features)
+          }
+          if (
+            cachedOutletAnalysis &&
+            hasDefaultOutletAnalysisScope(outletAnalysisScopeRef.current) &&
+            outletAnalysisRequestKeyRef.current === defaultOutletScopeKey
+          ) {
+            setOutletAnalysis(cachedOutletAnalysis)
+          }
+
+          setIsDatasetLoading(false)
+
+          if (cachedAnalysis == null || cachedOutletAnalysis == null) {
+            setLoadingPhaseLabel('Loading analysis tables.')
+          }
+
+          const analysisPromise =
+            cachedAnalysis != null
+              ? Promise.resolve(cachedAnalysis)
+              : loadAnalysisObservations({ datasetId: requestedDatasetId })
+          const outletPromise =
+            cachedOutletAnalysis != null
+              ? Promise.resolve(cachedOutletAnalysis)
+              : loadOutletAnalysis({ datasetId: requestedDatasetId })
+
+          const [analysisResult, outletResult] = await Promise.allSettled([
+            analysisPromise,
+            outletPromise,
+          ])
+
+          if (ignore) {
+            return
+          }
+
+          startTransition(() => {
+            if (analysisResult.status === 'fulfilled') {
+              setAnalysisObservations(analysisResult.value.features)
+            }
+            if (
+              outletResult.status === 'fulfilled' &&
+              hasDefaultOutletAnalysisScope(outletAnalysisScopeRef.current) &&
+              outletAnalysisRequestKeyRef.current === defaultOutletScopeKey
+            ) {
+              setOutletAnalysis(outletResult.value)
+            }
+            setIsAnalysisLoading(false)
+            setIsOutletAnalysisLoading(false)
+          })
+
+          return
+        }
+
         if (cachedAnalysis == null || cachedOutletAnalysis == null) {
           setLoadingPhaseLabel('Loading analysis tables.')
           setLoadingProgressTarget(88)
@@ -2438,7 +2492,7 @@ export default function App() {
         </div>
         <div className="topbar__meta">
           <label className="field field--topbar">
-            <span>DuckDB Dataset</span>
+            <span>Census Dataset</span>
             <select
               value={activeDatasetId}
               onChange={(event) => handleDatasetSelection(event.target.value)}
