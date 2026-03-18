@@ -223,6 +223,10 @@ class DashboardStore:
             connection.close()
 
     def _build_observations_payload(self, descriptor: DatasetDescriptor) -> dict[str, Any]:
+        prebuilt_payload = load_prebuilt_observations_payload(descriptor)
+        if prebuilt_payload is not None:
+            return prebuilt_payload
+
         connection = connect_with_runtime_tables(descriptor)
 
         try:
@@ -267,6 +271,20 @@ def load_prebuilt_metrics_payload(
             "wards": json.loads(required_paths["wards"].read_text(encoding="utf-8")),
             "summary": json.loads(required_paths["summary"].read_text(encoding="utf-8")),
         }
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def load_prebuilt_observations_payload(
+    descriptor: DatasetDescriptor,
+) -> dict[str, Any] | None:
+    output_paths = builder.build_dataset_output_paths(descriptor.id)
+    observations_path = output_paths["observations"]
+    if not observations_path.exists():
+        return None
+
+    try:
+        return json.loads(observations_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
 

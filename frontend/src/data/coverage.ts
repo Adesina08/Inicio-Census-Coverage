@@ -225,7 +225,17 @@ async function fetchJson<T>(
   }
 
   if (!response.ok) {
-    throw new Error(`Failed to load ${path} (${response.status})`)
+    let errorDetail = ''
+    try {
+      const responseBody = (await response.json()) as { error?: string }
+      if (typeof responseBody?.error === 'string' && responseBody.error.trim()) {
+        errorDetail = `: ${responseBody.error.trim()}`
+      }
+    } catch {
+      // Ignore non-JSON error bodies and fall back to the HTTP status only.
+    }
+
+    throw new Error(`Failed to load ${path} (${response.status})${errorDetail}`)
   }
 
   return (await response.json()) as T
