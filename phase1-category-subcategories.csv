@@ -1,0 +1,92 @@
+category,subcategory,source_group,code,column_name,record_count,label_status
+Baby food,formula,bbyfd_cate,1,bbyfd_cate/1,14110,explicit_from_schema
+Baby food,cereal,bbyfd_cate,2,bbyfd_cate/2,19601,explicit_from_schema
+Baby food,babydia,bbyfd_cate,3,bbyfd_cate/3,70552,explicit_from_schema
+Baby food,Baby food option 4,bbyfd_cate,4,bbyfd_cate/4,28080,coded_only_placeholder
+Baby food,Other baby food option 1,oth_baby,1,oth_baby/1,28080,coded_only_placeholder
+Confectionery,chewing,conf_cate,1,conf_cate/1,110117,explicit_from_schema
+Confectionery,candies,conf_cate,2,conf_cate/2,93970,explicit_from_schema
+Confectionery,choco,conf_cate,3,conf_cate/3,73517,explicit_from_schema
+Food,instant,food_cate_hand,1,food_cate_hand/1,276128,explicit_from_schema
+Food,pasta,food_cate_hand,2,food_cate_hand/2,248694,explicit_from_schema
+Food,seasonings,food_cate_hand,3,food_cate_hand/3,244916,explicit_from_schema
+Food,tomatopaste,food_cate_hand,4,food_cate_hand/4,237132,explicit_from_schema
+Food,salt,food_cate_hand,5,food_cate_hand/5,216199,explicit_from_schema
+Food,edibleoil,food_cate_hand,6,food_cate_hand/6,198920,explicit_from_schema
+Food,powderedmilk,food_cate_hand,7,food_cate_hand/7,173383,explicit_from_schema
+Food,uht,food_cate_hand,8,food_cate_hand/8,34598,explicit_from_schema
+Food,evaporatedmilk,food_cate_hand,9,food_cate_hand/9,136624,explicit_from_schema
+Food,breakfastcereal,food_cate_hand,10,food_cate_hand/10,110811,explicit_from_schema
+Food,packagedrice,food_cate_hand,11,food_cate_hand/11,76445,explicit_from_schema
+Food,sugar,food_cate_hand,12,food_cate_hand/12,152808,explicit_from_schema
+Food,ballfoods,food_cate_hand,13,food_cate_hand/13,89734,explicit_from_schema
+Food,cocoabeverages,food_cate_hand,14,food_cate_hand/14,110282,explicit_from_schema
+Food,Food option 15,food_cate_hand,15,food_cate_hand/15,29115,coded_only_placeholder
+Food,Food option 99,food_cate_hand,99,food_cate_hand/99,83348,coded_only_placeholder
+Food,Other food option 1,oth_food,1,oth_food/1,57195,coded_only_placeholder
+Food,Other food option 2,oth_food,2,oth_food/2,58598,coded_only_placeholder
+Food,Other food option 3,oth_food,3,oth_food/3,55241,coded_only_placeholder
+Food,Other food option 4,oth_food,4,oth_food/4,69375,coded_only_placeholder
+Hair care,shampoo,haircare_cate,1,haircare_cate/1,65362,explicit_from_schema
+Hair care,conditioner,haircare_cate,2,haircare_cate/2,62772,explicit_from_schema
+Hair care,creams,haircare_cate,3,haircare_cate/3,75123,explicit_from_schema
+Hair care,Hair care option 4,haircare_cate,4,haircare_cate/4,48429,coded_only_placeholder
+Hair extensions,braids,hairex_cate,1,hairex_cate/1,37514,explicit_from_schema
+Hair extensions,locs,hairex_cate,2,hairex_cate/2,25308,explicit_from_schema
+Hair extensions,twist,hairex_cate,3,hairex_cate/3,31074,explicit_from_schema
+Hair extensions,curl,hairex_cate,4,hairex_cate/4,27731,explicit_from_schema
+Hair extensions,straight,hairex_cate,5,hairex_cate/5,32343,explicit_from_schema
+Hair extensions,Hair extensions option 99,hairex_cate,99,hairex_cate/99,20954,coded_only_placeholder
+Home care,toilat,home_cate,1,home_cate/1,80081,explicit_from_schema
+Home care,bleaches,home_cate,2,home_cate/2,78473,explicit_from_schema
+Home care,Home care option 3,home_cate,3,home_cate/3,110032,coded_only_placeholder
+Home care,Other home care option 1,oth_home,1,oth_home/1,31500,coded_only_placeholder
+Home care,Other home care option 2,oth_home,2,oth_home/2,33764,coded_only_placeholder
+Home care,Other home care option 3,oth_home,3,oth_home/3,24841,coded_only_placeholder
+Home care,Other home care option 4,oth_home,4,oth_home/4,13151,coded_only_placeholder
+Home care,Other home care option 5,oth_home,5,oth_home/5,24292,coded_only_placeholder
+Home care,Other home care option 6,oth_home,6,oth_home/6,36947,coded_only_placeholder
+Home care,Other home care option 7,oth_home,7,oth_home/7,98839,coded_only_placeholder
+Home care,Other home care option 8,oth_home,8,oth_home/8,94213,coded_only_placeholder
+Home care,Other home care option 9,oth_home,9,oth_home/9,81603,coded_only_placeholder
+Home care,Other home care option 10,oth_home,10,oth_home/10,53610,coded_only_placeholder
+Non-alcoholic beverages,csd,nonal_cate,1,nonal_cate/1,265922,explicit_from_schema
+Non-alcoholic beverages,frtj,nonal_cate,2,nonal_cate/2,134358,explicit_from_schema
+Non-alcoholic beverages,yogdrink,nonal_cate,3,nonal_cate/3,129208,explicit_from_schema
+Non-alcoholic beverages,engdrink,nonal_cate,4,nonal_cate/4,203379,explicit_from_schema
+Non-alcoholic beverages,flavomilk,nonal_cate,5,nonal_cate/5,135532,explicit_from_schema
+Non-alcoholic beverages,water,nonal_cate,6,nonal_cate/6,300161,explicit_from_schema
+Non-alcoholic beverages,maltdrink,nonal_cate,7,nonal_cate/7,238548,explicit_from_schema
+Nutraceuticals,multivitamin,nutra_cate,1,nutra_cate/1,32774,explicit_from_schema
+Nutraceuticals,Nutraceuticals option 99,nutra_cate,99,nutra_cate/99,29774,coded_only_placeholder
+Nutraceuticals,Other nutraceuticals option 1,oth_nutra,1,oth_nutra/1,27902,coded_only_placeholder
+Nutraceuticals,Other nutraceuticals option 2,oth_nutra,2,oth_nutra/2,27469,coded_only_placeholder
+Nutraceuticals,Other nutraceuticals option 3,oth_nutra,3,oth_nutra/3,27927,coded_only_placeholder
+Nutraceuticals,Other nutraceuticals option 4,oth_nutra,4,oth_nutra/4,22849,coded_only_placeholder
+Packaged snacks,biscuit,pckg_cate,1,pckg_cate/1,169350,explicit_from_schema
+Packaged snacks,chinchin,pckg_cate,2,pckg_cate/2,144428,explicit_from_schema
+Packaged snacks,cookie,pckg_cate,3,pckg_cate/3,76751,explicit_from_schema
+Packaged snacks,chip,pckg_cate,4,pckg_cate/4,90133,explicit_from_schema
+Packaged snacks,sausage,pckg_cate,5,pckg_cate/5,64710,explicit_from_schema
+Packaged snacks,Packaged snacks option 99,pckg_cate,99,pckg_cate/99,57408,coded_only_placeholder
+Personal care,toothpa,perso_cate,1,perso_cate/1,101639,explicit_from_schema
+Personal care,toothbr,perso_cate,2,perso_cate/2,87690,explicit_from_schema
+Personal care,Personal care option 3,perso_cate,3,perso_cate/3,99029,coded_only_placeholder
+Personal care,Other personal care option 1,oth_personal,1,oth_personal/1,37881,coded_only_placeholder
+Personal care,Other personal care option 2,oth_personal,2,oth_personal/2,28929,coded_only_placeholder
+Personal care,Other personal care option 3,oth_personal,3,oth_personal/3,26521,coded_only_placeholder
+Personal care,Other personal care option 4,oth_personal,4,oth_personal/4,50825,coded_only_placeholder
+Personal care,Other personal care option 5,oth_personal,5,oth_personal/5,77336,coded_only_placeholder
+Personal care,Other personal care option 6,oth_personal,6,oth_personal/6,83690,coded_only_placeholder
+Alcoholic beverages,beer,alcoholic_cate,1,alcoholic_cate/1,75207,explicit_from_schema
+Alcoholic beverages,rtd,alcoholic_cate,2,alcoholic_cate/2,38612,explicit_from_schema
+Alcoholic beverages,alcobrand,alcoholic_cate,3,alcoholic_cate/3,24154,explicit_from_schema
+Alcoholic beverages,alcogin,alcoholic_cate,4,alcoholic_cate/4,90733,explicit_from_schema
+Alcoholic beverages,alcoliquer,alcoholic_cate,5,alcoholic_cate/5,60278,explicit_from_schema
+Alcoholic beverages,rum,alcoholic_cate,6,alcoholic_cate/6,52289,explicit_from_schema
+Alcoholic beverages,schnapps,alcoholic_cate,7,alcoholic_cate/7,55489,explicit_from_schema
+Alcoholic beverages,vodka,alcoholic_cate,8,alcoholic_cate/8,36122,explicit_from_schema
+Alcoholic beverages,whisky,alcoholic_cate,9,alcoholic_cate/9,41897,explicit_from_schema
+Alcoholic beverages,Alcoholic beverages option 99,alcoholic_cate,99,alcoholic_cate/99,31553,coded_only_placeholder
+Tobacco,cigarettes,tobacco_cate,1,tobacco_cate/1,19173,explicit_from_schema
+Tobacco,Tobacco option 2,tobacco_cate,2,tobacco_cate/2,7220,coded_only_placeholder

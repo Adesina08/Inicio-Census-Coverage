@@ -1,0 +1,1869 @@
+from __future__ import annotations
+
+import csv
+import gzip
+import json
+import math
+import os
+import re
+import sys
+import traceback
+from collections import Counter
+from dataclasses import dataclass
+from functools import lru_cache
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from threading import Lock, Thread
+from typing import Any
+from urllib.parse import parse_qs, urlparse
+
+import duckdb
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from scripts import build_dashboard_data as builder
+
+
+@dataclass(frozen=True)
+class DatasetDescriptor:
+    id: str
+    label: str
+    source_file: str
+    source_path: Path
+
+
+class DashboardStore:
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._cache: dict[str, dict[str, Any]] = {}
+
+    def _discover_datasets(self) -> tuple[list[DatasetDescriptor], str]:
+        source_paths = builder.discover_duckdb_sources()
+        used_ids: set[str] = set()
+        descriptors: list[DatasetDescriptor] = []
+
+        for index, source_path in enumerate(source_paths, start=1):
+            descriptors.append(
+                DatasetDescriptor(
+                    id=builder.build_dataset_id(source_path, used_ids),
+                    label=builder.build_dataset_label(source_path, index),
+                    source_file=source_path.name,
+                    source_path=source_path,
+                )
+            )
+
+        default_dataset_id = descriptors[0].id if descriptors else ""
+        return descriptors, default_dataset_id
+
+    def _dataset_manifest(self, descriptors: list[DatasetDescriptor], default_dataset_id: str) -> dict[str, Any]:
+        datasets = []
+        for descriptor in descriptors:
+            cached = self._cache.get(descriptor.id)
+            generated_at = ""
+            if cached and cached.get("metrics"):
+                generated_at = cached["metrics"]["summary"].get("generatedAt", "")
+
+            datasets.append(
+                {
+                    "id": descriptor.id,
+                    "label": descriptor.label,
+                    "sourceFile": descriptor.source_file,
+                    "generatedAt": generated_at,
+                }
+            )
+
+        return {
+            "defaultDatasetId": default_dataset_id,
+            "datasets": datasets,
+        }
+
+    def get_manifest(self) -> dict[str, Any]:
+        descriptors, default_dataset_id = self._discover_datasets()
+        return self._dataset_manifest(descriptors, default_dataset_id)
+
+    def get_dashboard(
+        self,
+        dataset_id: str | None,
+        include_geometry: bool = True,
+        include_observations: bool = True,
+    ) -> dict[str, Any]:
+        descriptors, default_dataset_id = self._discover_datasets()
+        if not descriptors:
+            raise FileNotFoundError(f"No DuckDB sources found in {ROOT}")
+
+        descriptor_by_id = {descriptor.id: descriptor for descriptor in descriptors}
+        requested_descriptor = descriptor_by_id.get(dataset_id or "")
+        fallback_descriptor = descriptor_by_id.get(default_dataset_id) or descriptors[0]
+        candidate_descriptors: list[DatasetDescriptor] = []
+
+        if requested_descriptor is not None:
+            candidate_descriptors.append(requested_descriptor)
+        if fallback_descriptor not in candidate_descriptors:
+            candidate_descriptors.append(fallback_descriptor)
+        for descriptor in descriptors:
+            if descriptor not in candidate_descriptors:
+                candidate_descriptors.append(descriptor)
+
+        active_descriptor = candidate_descriptors[0]
+        payload: dict[str, Any] | None = None
+        last_error: Exception | None = None
+        for candidate in candidate_descriptors:
+            try:
+                payload = self._get_or_build_payload(candidate)
+                active_descriptor = candidate
+                break
+            except duckdb.IOException as error:
+                if requested_descriptor is not None and candidate.id == requested_descriptor.id:
+                    raise
+                last_error = error
+                continue
+
+        if payload is None:
+            raise last_error or FileNotFoundError(f"No readable DuckDB sources found in {ROOT}")
+
+        manifest = self._dataset_manifest(descriptors, default_dataset_id)
+
+        response = {
+            "datasetOptions": manifest["datasets"],
+            "activeDataset": {
+                "id": active_descriptor.id,
+                "label": active_descriptor.label,
+                "sourceFile": active_descriptor.source_file,
+                "generatedAt": payload["summary"].get("generatedAt", ""),
+            },
+            "states": payload["states"],
+            "lgas": payload["lgas"],
+            "wards": payload["wards"],
+            "observations": empty_feature_collection(),
+            "summary": payload["summary"],
+        }
+
+        if not include_geometry:
+            response["states"] = strip_collection_geometry(response["states"])
+            response["lgas"] = strip_collection_geometry(response["lgas"])
+            response["wards"] = strip_collection_geometry(response["wards"])
+
+        if include_observations:
+            response["observations"] = self._get_or_build_observations(active_descriptor)
+
+        return response
+
+    def _get_or_build_payload(self, descriptor: DatasetDescriptor) -> dict[str, Any]:
+        stat_result = descriptor.source_path.stat()
+        source_token = (stat_result.st_mtime_ns, stat_result.st_size)
+
+        with self._lock:
+            cached = self._cache.get(descriptor.id)
+            if cached and cached["token"] != source_token:
+                cached = None
+
+            if not cached:
+                cached = {"token": source_token}
+                self._cache[descriptor.id] = cached
+
+            metrics_payload = cached.get("metrics")
+            if metrics_payload is None:
+                metrics_payload = self._build_metrics_payload(descriptor)
+                cached["metrics"] = metrics_payload
+
+            return metrics_payload
+
+    def _get_or_build_observations(self, descriptor: DatasetDescriptor) -> dict[str, Any]:
+        stat_result = descriptor.source_path.stat()
+        source_token = (stat_result.st_mtime_ns, stat_result.st_size)
+
+        with self._lock:
+            cached = self._cache.get(descriptor.id)
+            if cached and cached["token"] != source_token:
+                cached = None
+
+            if not cached:
+                cached = {"token": source_token}
+                self._cache[descriptor.id] = cached
+
+            observations_payload = cached.get("observations")
+            if observations_payload is None:
+                observations_payload = self._build_observations_payload(descriptor)
+                cached["observations"] = observations_payload
+
+            return observations_payload
+
+    def _build_metrics_payload(self, descriptor: DatasetDescriptor) -> dict[str, Any]:
+        connection = connect_with_runtime_tables(descriptor)
+
+        try:
+            state_counts, lga_counts, valid_gps_count = builder.load_observation_admin_counts(
+                connection
+            )
+            states_geojson = builder.transform_state_geojson(state_counts)
+            lgas_geojson = builder.transform_lga_geojson(lga_counts)
+            coverage_lookup = builder.load_ward_coverage_lookup(connection)
+            wards_geojson = builder.transform_ward_geojson_from_lookup(coverage_lookup)
+            summary = builder.build_runtime_dashboard_summary(
+                connection,
+                valid_gps_count,
+            )
+
+            return {
+                "states": states_geojson,
+                "lgas": lgas_geojson,
+                "wards": wards_geojson,
+                "summary": summary,
+            }
+        finally:
+            connection.close()
+
+    def _build_observations_payload(self, descriptor: DatasetDescriptor) -> dict[str, Any]:
+        connection = connect_with_runtime_tables(descriptor)
+
+        try:
+            return builder.load_frontend_observations(connection)
+        finally:
+            connection.close()
+
+
+STORE = DashboardStore()
+OUTLET_ANALYSIS_CACHE_LOCK = Lock()
+OUTLET_ANALYSIS_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
+PRODUCT_CATEGORY_ITEMS = sorted(
+    builder.PRODUCT_CATEGORY_LABELS.items(),
+    key=lambda item: int(item[0]),
+)
+CATEGORY_CODE_BY_LABEL = {
+    label: code for code, label in builder.PRODUCT_CATEGORY_LABELS.items()
+}
+SUBCATEGORY_MAPPING_CSV_PATH = Path.home() / "Downloads" / "Categories_Subcat_PROPER.csv"
+CLIENT_DISCONNECT_WINERRORS = {10053, 10054}
+CLIENT_DISCONNECT_ERRNOS = {32, 104}
+
+
+def _normalize_subcategory_mapping_value(value: str) -> str:
+    normalized = value.strip().lower()
+    normalized = re.sub(r"\s+category$", "", normalized)
+    normalized = re.sub(r"[^a-z0-9]+", "", normalized)
+    return normalized
+
+
+@lru_cache(maxsize=1)
+def _load_subcategory_proper_labels() -> dict[tuple[str, str], str]:
+    if not SUBCATEGORY_MAPPING_CSV_PATH.exists():
+        return {}
+
+    mapping: dict[tuple[str, str], str] = {}
+    with SUBCATEGORY_MAPPING_CSV_PATH.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            category_name = (row.get("product_category") or "").strip()
+            raw_subcategory_name = (row.get("product_sub_category") or "").strip()
+            proper_subcategory_name = (row.get("product_sub_category_PROPER") or "").strip()
+            if not category_name or not raw_subcategory_name or not proper_subcategory_name:
+                continue
+
+            mapping[
+                (
+                    _normalize_subcategory_mapping_value(category_name),
+                    _normalize_subcategory_mapping_value(raw_subcategory_name),
+                )
+            ] = proper_subcategory_name
+
+    return mapping
+
+
+def _subcategory_placeholder_label(category_name: str, subcategory_code: str) -> str:
+    return f"{category_name} option {subcategory_code}"
+
+
+def _build_subcategory_mapping_rows() -> list[tuple[str, str, str]]:
+    proper_labels = _load_subcategory_proper_labels()
+    rows: list[tuple[str, str, str]] = []
+
+    for definition in builder.OUTLET_SUBCATEGORY_GROUPS:
+        category_name = str(definition["categoryLabel"])
+        for code, raw_label in dict(definition["knownLabels"]).items():
+            proper_label = proper_labels.get(
+                (
+                    _normalize_subcategory_mapping_value(category_name),
+                    _normalize_subcategory_mapping_value(str(raw_label)),
+                ),
+                str(raw_label),
+            )
+            rows.append((category_name, str(code), proper_label))
+
+    return rows
+
+
+def strip_collection_geometry(collection: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "type": collection["type"],
+        "features": [
+            {
+                "type": feature["type"],
+                "id": feature.get("id"),
+                "properties": feature["properties"],
+            }
+            for feature in collection["features"]
+        ],
+    }
+
+
+def empty_feature_collection() -> dict[str, Any]:
+    return {
+        "type": "FeatureCollection",
+        "features": [],
+    }
+
+
+def _encode_varint(value: int) -> bytes:
+    buffer = bytearray()
+    unsigned = int(value)
+    while True:
+        next_value = unsigned & 0x7F
+        unsigned >>= 7
+        if unsigned:
+            buffer.append(next_value | 0x80)
+        else:
+            buffer.append(next_value)
+            break
+    return bytes(buffer)
+
+
+def _encode_length_delimited(field_number: int, payload: bytes) -> bytes:
+    return _encode_varint((field_number << 3) | 2) + _encode_varint(len(payload)) + payload
+
+
+def _encode_uint_field(field_number: int, value: int) -> bytes:
+    return _encode_varint((field_number << 3) | 0) + _encode_varint(value)
+
+
+def _encode_string_field(field_number: int, value: str) -> bytes:
+    return _encode_length_delimited(field_number, value.encode("utf-8"))
+
+
+def _zig_zag_encode(value: int) -> int:
+    return (value << 1) ^ (value >> 31)
+
+
+def _encode_packed_uints(field_number: int, values: list[int]) -> bytes:
+    payload = b"".join(_encode_varint(value) for value in values)
+    return _encode_length_delimited(field_number, payload)
+
+
+def _encode_mvt_value(value: str) -> bytes:
+    return _encode_string_field(1, value)
+
+
+def _tile_bounds(z_value: int, x_value: int, y_value: int) -> tuple[float, float, float, float]:
+    tiles_per_axis = 2**z_value
+    west = (x_value / tiles_per_axis) * 360.0 - 180.0
+    east = ((x_value + 1) / tiles_per_axis) * 360.0 - 180.0
+
+    def tile_y_to_latitude(tile_y: float) -> float:
+        radians = math.atan(math.sinh(math.pi * (1 - (2 * tile_y / tiles_per_axis))))
+        return math.degrees(radians)
+
+    north = tile_y_to_latitude(y_value)
+    south = tile_y_to_latitude(y_value + 1)
+    return west, south, east, north
+
+
+def _tile_pixel_coordinates(
+    longitude: float,
+    latitude: float,
+    z_value: int,
+    x_value: int,
+    y_value: int,
+    extent: int,
+) -> tuple[int, int]:
+    clamped_latitude = max(min(latitude, 85.05112878), -85.05112878)
+    world_scale = extent * (2**z_value)
+    normalized_x = (longitude + 180.0) / 360.0
+    latitude_radians = math.radians(clamped_latitude)
+    normalized_y = (
+        1.0
+        - math.asinh(math.tan(latitude_radians)) / math.pi
+    ) / 2.0
+
+    pixel_x = normalized_x * world_scale - (x_value * extent)
+    pixel_y = normalized_y * world_scale - (y_value * extent)
+    return int(round(pixel_x)), int(round(pixel_y))
+
+
+def _tile_bucket_size(z_value: int) -> int:
+    if z_value <= 5:
+        return 192
+    if z_value <= 7:
+        return 128
+    if z_value <= 8:
+        return 96
+    if z_value <= 9:
+        return 64
+    return 0
+
+
+def _build_point_tile_features(
+    rows: list[tuple[Any, Any, Any, Any]],
+    *,
+    z_value: int,
+    x_value: int,
+    y_value: int,
+    extent: int = 4096,
+) -> list[dict[str, Any]]:
+    bucket_size = _tile_bucket_size(z_value)
+
+    if bucket_size <= 0:
+        tile_features: list[dict[str, Any]] = []
+        for record_id, visit_status, latitude, longitude in rows:
+            if latitude is None or longitude is None:
+                continue
+
+            tile_x, tile_y = _tile_pixel_coordinates(
+                float(longitude),
+                float(latitude),
+                z_value,
+                x_value,
+                y_value,
+                extent,
+            )
+            tile_features.append(
+                {
+                    "id": len(tile_features) + 1,
+                    "geometry": (tile_x, tile_y),
+                    "properties": {
+                        "id": record_id or "",
+                        "status": visit_status or "Unknown",
+                        "pointCount": 1,
+                    },
+                }
+            )
+        return tile_features
+
+    buckets: dict[tuple[int, int], dict[str, Any]] = {}
+    for record_id, visit_status, latitude, longitude in rows:
+        if latitude is None or longitude is None:
+            continue
+
+        tile_x, tile_y = _tile_pixel_coordinates(
+            float(longitude),
+            float(latitude),
+            z_value,
+            x_value,
+            y_value,
+            extent,
+        )
+        bucket_key = (
+            max(0, min(extent - 1, tile_x)) // bucket_size,
+            max(0, min(extent - 1, tile_y)) // bucket_size,
+        )
+        status_key = visit_status or "Unknown"
+        bucket = buckets.get(bucket_key)
+
+        if bucket is None:
+            bucket = {
+                "sum_x": 0.0,
+                "sum_y": 0.0,
+                "count": 0,
+                "status_counts": Counter(),
+                "sample_id": record_id or "",
+            }
+            buckets[bucket_key] = bucket
+
+        bucket["sum_x"] += tile_x
+        bucket["sum_y"] += tile_y
+        bucket["count"] += 1
+        bucket["status_counts"][status_key] += 1
+
+    tile_features: list[dict[str, Any]] = []
+    for bucket in buckets.values():
+        point_count = int(bucket["count"])
+        dominant_status = max(
+            bucket["status_counts"].items(),
+            key=lambda item: (item[1], item[0] == "Completed", item[0]),
+        )[0]
+        tile_features.append(
+            {
+                "id": len(tile_features) + 1,
+                "geometry": (
+                    int(round(bucket["sum_x"] / point_count)),
+                    int(round(bucket["sum_y"] / point_count)),
+                ),
+                "properties": {
+                    "id": bucket["sample_id"],
+                    "status": dominant_status,
+                    "pointCount": point_count,
+                },
+            }
+        )
+
+    return tile_features
+
+
+def _encode_mvt_layer(layer_name: str, features: list[dict[str, Any]], extent: int = 4096) -> bytes:
+    key_index: dict[str, int] = {}
+    keys: list[str] = []
+    value_index: dict[str, int] = {}
+    values: list[str] = []
+    encoded_features: list[bytes] = []
+
+    for feature in features:
+        properties = feature["properties"]
+        tags: list[int] = []
+        for key, raw_value in properties.items():
+            if raw_value is None:
+                continue
+
+            value = str(raw_value)
+            if key not in key_index:
+                key_index[key] = len(keys)
+                keys.append(key)
+            if value not in value_index:
+                value_index[value] = len(values)
+                values.append(value)
+
+            tags.append(key_index[key])
+            tags.append(value_index[value])
+
+        geometry = feature["geometry"]
+        geometry_commands = [
+            (1 & 0x7) | (1 << 3),
+            _zig_zag_encode(int(geometry[0])),
+            _zig_zag_encode(int(geometry[1])),
+        ]
+
+        feature_payload = bytearray()
+        if feature.get("id") is not None:
+            feature_payload.extend(_encode_uint_field(1, int(feature["id"])))
+        if tags:
+            feature_payload.extend(_encode_packed_uints(2, tags))
+        feature_payload.extend(_encode_uint_field(3, 1))
+        feature_payload.extend(_encode_packed_uints(4, geometry_commands))
+        encoded_features.append(_encode_length_delimited(2, bytes(feature_payload)))
+
+    layer_payload = bytearray()
+    layer_payload.extend(_encode_string_field(1, layer_name))
+    for encoded_feature in encoded_features:
+        layer_payload.extend(encoded_feature)
+    for key in keys:
+        layer_payload.extend(_encode_string_field(3, key))
+    for value in values:
+        layer_payload.extend(_encode_length_delimited(4, _encode_mvt_value(value)))
+    layer_payload.extend(_encode_uint_field(5, extent))
+    layer_payload.extend(_encode_uint_field(15, 2))
+    return _encode_length_delimited(3, bytes(layer_payload))
+
+
+def encode_point_tile(features: list[dict[str, Any]], layer_name: str = "points") -> bytes:
+    return _encode_mvt_layer(layer_name, features)
+
+
+def resolve_active_descriptor(dataset_id: str | None) -> DatasetDescriptor:
+    descriptors, default_dataset_id = STORE._discover_datasets()
+    if not descriptors:
+        raise FileNotFoundError(f"No DuckDB sources found in {ROOT}")
+
+    descriptor_by_id = {descriptor.id: descriptor for descriptor in descriptors}
+    return (
+        descriptor_by_id.get(dataset_id or "")
+        or descriptor_by_id.get(default_dataset_id)
+        or descriptors[0]
+    )
+
+
+def is_client_disconnect_error(error: BaseException) -> bool:
+    if isinstance(error, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)):
+        return True
+
+    if isinstance(error, OSError):
+        if getattr(error, "winerror", None) in CLIENT_DISCONNECT_WINERRORS:
+            return True
+        if getattr(error, "errno", None) in CLIENT_DISCONNECT_ERRNOS:
+            return True
+
+    return False
+
+
+def connect_with_runtime_tables(descriptor: DatasetDescriptor) -> duckdb.DuckDBPyConnection:
+    connection = duckdb.connect(str(descriptor.source_path), read_only=True)
+    if builder.runtime_tables_are_current(connection):
+        return connection
+
+    connection.close()
+    connection = duckdb.connect(str(descriptor.source_path), read_only=False)
+    builder.ensure_runtime_dataset_tables(connection, force_rebuild=True)
+    return connection
+
+
+def _sql_string_literal(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _normalized_sql_text(column_name: str) -> str:
+    return f"coalesce(nullif(trim(coalesce({column_name}, '')), ''), 'Unknown')"
+
+
+def _normalized_admin_sql(column_name: str) -> str:
+    base_expression = (
+        "regexp_replace("
+        f"replace(lower(trim(coalesce({column_name}, ''))), '&', 'and'), "
+        "'[^a-z0-9]+', '', 'g'"
+        ")"
+    )
+    return f"""
+        case {base_expression}
+          when 'fct' then 'federalcapitalterritory'
+          when 'federalcapitalterritoryabuja' then 'federalcapitalterritory'
+          when 'municipalareacouncil' then 'amac'
+          when 'portharcourt' then 'portharcourtcity'
+          when 'ifakoijaye' then 'ifakoijaiye'
+          else {base_expression}
+        end
+    """
+
+
+def _ward_key_sql() -> str:
+    return (
+        "concat_ws('::', "
+        f"{_normalized_admin_sql('state_name')}, "
+        f"{_normalized_admin_sql('lga_name')}, "
+        f"{_normalized_admin_sql('ward_name')}"
+        ")"
+    )
+
+
+def _product_category_match_sql(column_name: str, code: str) -> str:
+    return f"regexp_matches(coalesce({column_name}, ''), '(^|\\s){code}(\\s|$)')"
+
+
+def _build_outlet_scope_filters(
+    *,
+    state_name: str | None = None,
+    lga_name: str | None = None,
+    ward_key: str | None = None,
+    category_name: str | None = None,
+    outlet_type: str | None = None,
+    outlet_types: list[str] | None = None,
+) -> tuple[list[str], list[Any]]:
+    filters = ["1 = 1"]
+    params: list[Any] = []
+
+    if state_name and state_name != "all":
+        filters.append("state_name = ?")
+        params.append(state_name)
+
+    if lga_name and lga_name != "all":
+        filters.append("lga_name = ?")
+        params.append(lga_name)
+
+    if ward_key:
+        filters.append(f"{_ward_key_sql()} = ?")
+        params.append(ward_key)
+
+    if category_name and category_name != "all":
+        category_code = CATEGORY_CODE_BY_LABEL.get(category_name)
+        if category_code:
+            filters.append(_product_category_match_sql("product_category_codes_raw", category_code))
+        else:
+            filters.append("1 = 0")
+
+    normalized_outlet_types = [
+        value.strip()
+        for value in (outlet_types or ([] if outlet_type is None else [outlet_type]))
+        if value and value.strip() and value.strip() != "all"
+    ]
+    if normalized_outlet_types:
+        placeholders = ", ".join("?" for _ in normalized_outlet_types)
+        filters.append(f"{_normalized_sql_text('outlet_type')} in ({placeholders})")
+        params.extend(normalized_outlet_types)
+
+    return filters, params
+
+
+def _prepare_outlet_analysis_base_table(connection: duckdb.DuckDBPyConnection) -> None:
+    source_table_name = builder.resolve_observation_source_table(connection)
+    table_columns = builder.get_table_columns(connection, source_table_name)
+    source_rows_query = builder.build_source_rows_query(source_table_name, table_columns)
+
+    connection.execute("drop table if exists outlet_analysis_base")
+    connection.execute(
+        f"""
+        create temporary table outlet_analysis_base as
+        with source_rows as (
+          {source_rows_query}
+        )
+        select
+          state_name,
+          lga_name,
+          ward_name,
+          concat_ws('::', coalesce(state_name, ''), coalesce(lga_name, ''), coalesce(ward_name, '')) as ward_key,
+          coalesce(nullif(trim(coalesce(outlet_type, '')), ''), 'Unknown') as outlet_type,
+          product_category_codes_raw,
+          case
+            when coalesce(
+              cast(cast(try_cast(interview_status_code as double) as integer) as varchar),
+              interview_status_code
+            ) = '1' then 'Completed'
+            when coalesce(
+              cast(cast(try_cast(interview_status_code as double) as integer) as varchar),
+              interview_status_code
+            ) = '2' then 'Observation'
+            when coalesce(
+              cast(cast(try_cast(interview_status_code as double) as integer) as varchar),
+              interview_status_code
+            ) = '3' then 'Restricted'
+            else coalesce(nullif(trim(coalesce(interview_status_label, '')), ''), 'Unknown')
+          end as visit_status
+        from source_rows
+        where nullif(trim(coalesce(state_name, '')), '') is not null
+          and nullif(trim(coalesce(lga_name, '')), '') is not null
+          and nullif(trim(coalesce(ward_name, '')), '') is not null
+        """
+    )
+
+
+def _build_outlet_scope_query(table_name: str, filters: list[str]) -> str:
+    subcategory_columns_sql = ",\n          ".join(
+        str(definition["fieldAlias"]) for definition in builder.OUTLET_SUBCATEGORY_GROUPS
+    )
+    return f"""
+        select
+          state_name,
+          lga_name,
+          ward_name,
+          {_ward_key_sql()} as ward_key,
+          coalesce(nullif(trim(coalesce(outlet_type, '')), ''), 'Unknown') as outlet_type,
+          product_category_codes_raw,
+          {subcategory_columns_sql},
+          visit_status
+        from {table_name}
+        where {' and '.join(filters)}
+    """
+
+
+def _materialize_outlet_scope(
+    connection: duckdb.DuckDBPyConnection,
+    *,
+    table_name: str,
+    source_table_name: str,
+    filters: list[str],
+    params: list[Any],
+) -> None:
+    connection.execute(f"drop table if exists {table_name}")
+    connection.execute(
+        f"""
+        create temporary table {table_name} as
+        {_build_outlet_scope_query(source_table_name, filters)}
+        """,
+        params,
+    )
+
+
+def _category_filter_definitions(*, include_uncategorized: bool) -> list[tuple[str, str]]:
+    category_filters = [
+        (label, _product_category_match_sql("product_category_codes_raw", code))
+        for code, label in PRODUCT_CATEGORY_ITEMS
+    ]
+
+    if include_uncategorized:
+        category_filters.append(
+            (
+                "No category recorded",
+                "nullif(trim(coalesce(product_category_codes_raw, '')), '') is null",
+            )
+        )
+
+    return category_filters
+
+
+def _build_outlet_category_scope_query(table_name: str) -> str:
+    category_union_parts = [
+        """
+        select
+          state_name,
+          lga_name,
+          ward_name,
+          ward_key,
+          outlet_type,
+          visit_status,
+          category_code
+        from {table_name},
+        unnest(regexp_split_to_array(trim(coalesce(product_category_codes_raw, '')), '\\s+')) as split_codes(category_code)
+        where nullif(trim(coalesce(product_category_codes_raw, '')), '') is not null
+          and nullif(trim(category_code), '') is not null
+        """.format(table_name=table_name),
+        """
+        select
+          state_name,
+          lga_name,
+          ward_name,
+          ward_key,
+          outlet_type,
+          visit_status,
+          null as category_code
+        from {table_name}
+        where nullif(trim(coalesce(product_category_codes_raw, '')), '') is null
+        """.format(table_name=table_name),
+    ]
+
+    category_mapping_rows_sql = ",\n              ".join(
+        f"({_sql_string_literal(code)}, {_sql_string_literal(label)})"
+        for code, label in PRODUCT_CATEGORY_ITEMS
+    )
+
+    return f"""
+        with exploded_categories as (
+          {' union all '.join(category_union_parts)}
+        ),
+        category_mapping(category_code, category_name) as (
+          values
+              {category_mapping_rows_sql}
+        )
+        select
+          exploded_categories.state_name,
+          exploded_categories.lga_name,
+          exploded_categories.ward_name,
+          exploded_categories.ward_key,
+          exploded_categories.outlet_type,
+          exploded_categories.visit_status,
+          coalesce(
+            category_mapping.category_name,
+            case
+              when exploded_categories.category_code is null then 'No category recorded'
+              else exploded_categories.category_code
+            end
+          ) as category_name
+        from exploded_categories
+        left join category_mapping
+          on exploded_categories.category_code = category_mapping.category_code
+    """
+
+
+def _materialize_outlet_category_scope(
+    connection: duckdb.DuckDBPyConnection,
+    *,
+    table_name: str,
+    source_table_name: str,
+) -> None:
+    connection.execute(f"drop table if exists {table_name}")
+    connection.execute(
+        f"""
+        create temporary table {table_name} as
+        {_build_outlet_category_scope_query(source_table_name)}
+        """
+    )
+
+
+def _build_outlet_subcategory_scope_query(table_name: str) -> str:
+    union_parts: list[str] = []
+    for definition in builder.OUTLET_SUBCATEGORY_GROUPS:
+        field_alias = str(definition["fieldAlias"])
+        category_name = _sql_string_literal(str(definition["categoryLabel"]))
+        union_parts.append(
+            f"""
+            select
+              state_name,
+              lga_name,
+              ward_name,
+              ward_key,
+              outlet_type,
+              visit_status,
+              {category_name} as category_name,
+              subcategory_code
+            from {table_name},
+            unnest(regexp_split_to_array(trim(coalesce({field_alias}, '')), '\\s+')) as split_codes(subcategory_code)
+            where nullif(trim(coalesce({field_alias}, '')), '') is not null
+              and nullif(trim(subcategory_code), '') is not null
+            """
+        )
+
+    return "\n            union all\n".join(union_parts)
+
+
+def _materialize_outlet_subcategory_scope(
+    connection: duckdb.DuckDBPyConnection,
+    *,
+    table_name: str,
+    source_table_name: str,
+) -> None:
+    connection.execute(f"drop table if exists {table_name}")
+    mapping_rows = _build_subcategory_mapping_rows()
+
+    connection.execute("drop table if exists outlet_subcategory_label_map")
+    connection.execute(
+        """
+        create temporary table outlet_subcategory_label_map (
+          category_name varchar,
+          subcategory_code varchar,
+          subcategory_name varchar
+        )
+        """
+    )
+    if mapping_rows:
+        connection.executemany(
+            "insert into outlet_subcategory_label_map values (?, ?, ?)",
+            mapping_rows,
+        )
+
+    connection.execute(
+        f"""
+        create temporary table {table_name} as
+        with exploded_codes as (
+          {_build_outlet_subcategory_scope_query(source_table_name)}
+        )
+        select
+          exploded_codes.state_name,
+          exploded_codes.lga_name,
+          exploded_codes.ward_name,
+          exploded_codes.ward_key,
+          exploded_codes.outlet_type,
+          exploded_codes.visit_status,
+          exploded_codes.category_name,
+          exploded_codes.subcategory_code,
+          coalesce(
+            mapping.subcategory_name,
+            {_sql_string_literal('')} || exploded_codes.category_name || ' option ' || exploded_codes.subcategory_code
+          ) as subcategory_name
+        from exploded_codes
+        left join outlet_subcategory_label_map as mapping
+          on exploded_codes.category_name = mapping.category_name
+         and exploded_codes.subcategory_code = mapping.subcategory_code
+        """
+    )
+
+
+def fetch_outlet_analysis(
+    descriptor: DatasetDescriptor,
+    *,
+    state_name: str | None,
+    lga_name: str | None,
+    ward_key: str | None,
+    category_name: str | None,
+    outlet_type: str | None,
+    outlet_types: list[str] | None = None,
+) -> dict[str, Any]:
+    normalized_outlet_types = tuple(
+        sorted(
+            {
+                value.strip()
+                for value in (outlet_types or ([] if outlet_type is None else [outlet_type]))
+                if value and value.strip() and value.strip() != "all"
+            }
+        )
+    )
+    stat_result = descriptor.source_path.stat()
+    cache_key = (
+        descriptor.id,
+        stat_result.st_mtime_ns,
+        stat_result.st_size,
+        state_name or "",
+        lga_name or "",
+        ward_key or "",
+        category_name or "",
+        normalized_outlet_types,
+    )
+    with OUTLET_ANALYSIS_CACHE_LOCK:
+        cached_payload = OUTLET_ANALYSIS_CACHE.get(cache_key)
+        if cached_payload is not None:
+            return cached_payload
+
+    connection = connect_with_runtime_tables(descriptor)
+
+    try:
+        source_table_name = "gps_events_clean"
+
+        option_filters, option_params = _build_outlet_scope_filters(
+            state_name=state_name,
+            lga_name=lga_name,
+        )
+        analysis_filters, analysis_params = _build_outlet_scope_filters(
+            state_name=state_name,
+            lga_name=lga_name,
+            ward_key=ward_key,
+            category_name=category_name,
+        )
+        filtered_filters, filtered_params = _build_outlet_scope_filters(
+            state_name=state_name,
+            lga_name=lga_name,
+            ward_key=ward_key,
+            category_name=category_name,
+            outlet_type=outlet_type,
+            outlet_types=outlet_types,
+        )
+
+        _materialize_outlet_scope(
+            connection,
+            table_name="outlet_option_scope",
+            source_table_name=source_table_name,
+            filters=option_filters,
+            params=option_params,
+        )
+        _materialize_outlet_scope(
+            connection,
+            table_name="outlet_analysis_scope",
+            source_table_name=source_table_name,
+            filters=analysis_filters,
+            params=analysis_params,
+        )
+        _materialize_outlet_scope(
+            connection,
+            table_name="outlet_filtered_scope",
+            source_table_name=source_table_name,
+            filters=filtered_filters,
+            params=filtered_params,
+        )
+        _materialize_outlet_category_scope(
+            connection,
+            table_name="outlet_option_category_scope",
+            source_table_name="outlet_option_scope",
+        )
+        _materialize_outlet_category_scope(
+            connection,
+            table_name="outlet_analysis_category_scope",
+            source_table_name="outlet_analysis_scope",
+        )
+        _materialize_outlet_category_scope(
+            connection,
+            table_name="outlet_filtered_category_scope",
+            source_table_name="outlet_filtered_scope",
+        )
+        _materialize_outlet_subcategory_scope(
+            connection,
+            table_name="outlet_analysis_subcategory_scope",
+            source_table_name="outlet_analysis_scope",
+        )
+        _materialize_outlet_subcategory_scope(
+            connection,
+            table_name="outlet_filtered_subcategory_scope",
+            source_table_name="outlet_filtered_scope",
+        )
+
+        state_options = [
+            row[0]
+            for row in connection.execute(
+                f"""
+                select distinct state_name
+                from {source_table_name}
+                where nullif(trim(coalesce(state_name, '')), '') is not null
+                order by state_name asc
+                """
+            ).fetchall()
+        ]
+        lga_options = [
+            row[0]
+            for row in connection.execute(
+                f"""
+                select distinct lga_name
+                from outlet_option_scope
+                where nullif(trim(coalesce(lga_name, '')), '') is not null
+                order by lga_name asc
+                """
+            ).fetchall()
+        ]
+        category_options = [
+            row[0]
+            for row in connection.execute(
+                """
+                select distinct category_name
+                from outlet_option_category_scope
+                where category_name <> 'No category recorded'
+                order by category_name asc
+                """
+            ).fetchall()
+        ]
+
+        scope_record_count = int(
+            connection.execute(
+                "select count(*) from outlet_analysis_scope",
+            ).fetchone()[0]
+            or 0
+        )
+        filtered_record_count = int(
+            connection.execute(
+                "select count(*) from outlet_filtered_scope",
+            ).fetchone()[0]
+            or 0
+        )
+
+        outlet_type_base_rows = connection.execute(
+            f"""
+            select
+              outlet_type,
+              count(*) as record_count,
+              sum(case when visit_status = 'Completed' then 1 else 0 end) as completed_count,
+              sum(case when visit_status = 'Observation' then 1 else 0 end) as observation_count,
+              count(distinct state_name) as state_count,
+              count(distinct concat_ws('::', coalesce(state_name, ''), coalesce(lga_name, ''))) as lga_count,
+              count(distinct ward_key) as ward_count
+            from outlet_analysis_scope
+            group by 1
+            order by 2 desc, 1 asc
+            """
+        ).fetchall()
+        outlet_type_category_rows = [
+            (str(outlet_type_name), str(category_name), int(record_count or 0))
+            for outlet_type_name, category_name, record_count in connection.execute(
+                """
+                select
+                  outlet_type,
+                  category_name,
+                  count(*) as record_count
+                from outlet_analysis_category_scope
+                group by 1, 2
+                order by 1 asc, 3 desc, 2 asc
+                """
+            ).fetchall()
+        ]
+
+        category_rows = [
+            (
+                str(category_name),
+                int(record_count or 0),
+                int(completed_count or 0),
+                int(observation_count or 0),
+                int(state_count or 0),
+                int(lga_count or 0),
+                int(ward_count or 0),
+            )
+            for (
+                category_name,
+                record_count,
+                completed_count,
+                observation_count,
+                state_count,
+                lga_count,
+                ward_count,
+            ) in connection.execute(
+                """
+                select
+                  category_name,
+                  count(*) as record_count,
+                  sum(case when visit_status = 'Completed' then 1 else 0 end) as completed_count,
+                  sum(case when visit_status = 'Observation' then 1 else 0 end) as observation_count,
+                  count(distinct state_name) as state_count,
+                  count(distinct concat_ws('::', coalesce(state_name, ''), coalesce(lga_name, ''))) as lga_count,
+                  count(distinct ward_key) as ward_count
+                from outlet_filtered_category_scope
+                group by 1
+                order by 2 desc, 1 asc
+                """
+            ).fetchall()
+        ]
+
+        categories_by_outlet_type: dict[str, list[tuple[str, int]]] = {}
+        for outlet_type_name, category_label, record_count in outlet_type_category_rows:
+            categories_by_outlet_type.setdefault(str(outlet_type_name), []).append(
+                (str(category_label), int(record_count or 0))
+            )
+
+        outlet_type_rows = []
+        for (
+            outlet_type_name,
+            record_count,
+            completed_count,
+            observation_count,
+            state_count,
+            lga_count,
+            ward_count,
+        ) in outlet_type_base_rows:
+            category_counts = categories_by_outlet_type.get(str(outlet_type_name), [])
+            categories_summary = ", ".join(
+                f"{category_label} ({count})"
+                for category_label, count in category_counts
+            )
+            outlet_type_rows.append(
+                {
+                    "outletType": str(outlet_type_name),
+                    "count": int(record_count or 0),
+                    "completedCount": int(completed_count or 0),
+                    "observationCount": int(observation_count or 0),
+                    "sharePercent": (
+                        0
+                        if scope_record_count == 0
+                        else (int(record_count or 0) / scope_record_count) * 100
+                    ),
+                    "stateCount": int(state_count or 0),
+                    "lgaCount": int(lga_count or 0),
+                    "wardCount": int(ward_count or 0),
+                    "distinctCategoryCount": len(category_counts),
+                    "categoriesSummary": categories_summary,
+                }
+            )
+
+        outlet_category_rows = [
+            {
+                "categoryName": str(category_label),
+                "count": int(record_count or 0),
+                "completedCount": int(completed_count or 0),
+                "observationCount": int(observation_count or 0),
+                "sharePercent": (
+                    0
+                    if filtered_record_count == 0
+                    else (int(record_count or 0) / filtered_record_count) * 100
+                ),
+                "stateCount": int(state_count or 0),
+                "lgaCount": int(lga_count or 0),
+                "wardCount": int(ward_count or 0),
+            }
+            for (
+                category_label,
+                record_count,
+                completed_count,
+                observation_count,
+                state_count,
+                lga_count,
+                ward_count,
+            ) in category_rows
+        ]
+        subcategory_rows = connection.execute(
+            """
+            select
+              category_name,
+              subcategory_name,
+              count(*) as record_count,
+              sum(case when visit_status = 'Completed' then 1 else 0 end) as completed_count,
+              sum(case when visit_status = 'Observation' then 1 else 0 end) as observation_count,
+              count(distinct state_name) as state_count,
+              count(distinct concat_ws('::', coalesce(state_name, ''), coalesce(lga_name, ''))) as lga_count,
+              count(distinct ward_key) as ward_count
+            from outlet_filtered_subcategory_scope
+            group by 1, 2
+            order by 3 desc, 1 asc, 2 asc
+            """
+        ).fetchall()
+        outlet_subcategory_rows = [
+            {
+                "categoryName": str(category_name),
+                "subcategoryName": str(subcategory_name),
+                "count": int(record_count or 0),
+                "completedCount": int(completed_count or 0),
+                "observationCount": int(observation_count or 0),
+                "sharePercent": (
+                    0
+                    if filtered_record_count == 0
+                    else (int(record_count or 0) / filtered_record_count) * 100
+                ),
+                "stateCount": int(state_count or 0),
+                "lgaCount": int(lga_count or 0),
+                "wardCount": int(ward_count or 0),
+            }
+            for (
+                category_name,
+                subcategory_name,
+                record_count,
+                completed_count,
+                observation_count,
+                state_count,
+                lga_count,
+                ward_count,
+            ) in subcategory_rows
+        ]
+
+        payload = {
+            "stateOptions": state_options,
+            "lgaOptions": lga_options,
+            "categoryOptions": category_options,
+            "scopeRecordCount": scope_record_count,
+            "filteredRecordCount": filtered_record_count,
+            "outletTypeRows": outlet_type_rows,
+            "outletCategoryRows": outlet_category_rows,
+            "outletSubcategoryRows": outlet_subcategory_rows,
+        }
+        with OUTLET_ANALYSIS_CACHE_LOCK:
+            OUTLET_ANALYSIS_CACHE[cache_key] = payload
+        return payload
+    finally:
+        connection.close()
+
+
+def point_feature_from_row(row: tuple[Any, ...]) -> dict[str, Any]:
+    (
+        record_id,
+        event_ts,
+        submission_ts,
+        starttime,
+        endtime,
+        survey_date,
+        state_name,
+        lga_name,
+        ward_code,
+        ward_name,
+        collector_name,
+        device_id,
+        business_name,
+        outlet_type,
+        product_category_codes_raw,
+        channel_type,
+        visit_status,
+        interview_status_label,
+        review_state,
+        latitude,
+        longitude,
+        gps_accuracy,
+        gps_quality_flag,
+        effective_tolerance_m,
+    ) = row
+
+    return {
+        "type": "Feature",
+        "properties": {
+            "id": record_id,
+            "stateName": state_name,
+            "lgaName": lga_name,
+            "wardName": ward_name,
+            "wardCode": ward_code,
+            "wardKey": builder.build_ward_key(state_name, lga_name, ward_name),
+            "collectorName": collector_name or "Unknown collector",
+            "deviceId": device_id or "",
+            "status": visit_status or "Unknown",
+            "statusDetail": interview_status_label or visit_status or "Unknown",
+            "outletType": outlet_type or "Unknown",
+            "productCategoryCodes": builder.parse_multi_select_codes(product_category_codes_raw),
+            "productCategories": builder.broad_category_labels(product_category_codes_raw),
+            "channelType": channel_type or "Unknown",
+            "businessName": business_name or "Unnamed outlet",
+            "preApproval": False,
+            "gpsAccuracy": float(gps_accuracy or 0),
+            "gpsQualityFlag": gps_quality_flag or "unknown",
+            "effectiveToleranceM": float(
+                effective_tolerance_m or builder.DEFAULT_GPS_TOLERANCE_METERS
+            ),
+            "eventTs": builder.json_safe(event_ts),
+            "submissionTs": builder.json_safe(submission_ts),
+            "startTime": builder.json_safe(starttime),
+            "endTime": builder.json_safe(endtime),
+            "surveyDate": builder.json_safe(survey_date),
+            "reviewState": review_state or "",
+        },
+        "geometry": {
+            "type": "Point",
+            "coordinates": [float(longitude), float(latitude)],
+        },
+    }
+
+
+def fetch_map_points(
+    descriptor: DatasetDescriptor,
+    bbox: tuple[float, float, float, float],
+    zoom: float,
+    state_name: str | None,
+    lga_name: str | None,
+) -> dict[str, Any]:
+    west, south, east, north = bbox
+    connection = connect_with_runtime_tables(descriptor)
+
+    try:
+        params: list[Any] = [west, east, south, north]
+        filters = [
+            "longitude between ? and ?",
+            "latitude between ? and ?",
+            "gps_quality_flag not in ('missing', 'invalid', 'outside_nigeria')",
+        ]
+
+        if state_name and state_name != "all":
+            filters.append("state_name = ?")
+            params.append(state_name)
+
+        if lga_name and lga_name != "all":
+            filters.append("lga_name = ?")
+            params.append(lga_name)
+
+        where_clause = " and ".join(filters)
+        rows = connection.execute(
+            f"""
+            select
+              record_id,
+              cast(event_ts as varchar) as event_ts,
+              cast(submission_ts as varchar) as submission_ts,
+              cast(starttime as varchar) as starttime,
+              cast(endtime as varchar) as endtime,
+              cast(survey_date as varchar) as survey_date,
+              state_name,
+              lga_name,
+              ward_code,
+              ward_name,
+              collector_name,
+              device_id,
+              business_name,
+              outlet_type,
+              product_category_codes_raw,
+              channel_type,
+              visit_status,
+              interview_status_label,
+              review_state,
+              latitude,
+              longitude,
+              gps_accuracy,
+              gps_quality_flag,
+              effective_tolerance_m
+            from gps_events_clean
+            where {where_clause}
+            order by event_ts asc, record_id asc
+            """,
+            params,
+        ).fetchall()
+
+        return {
+            "type": "FeatureCollection",
+            "features": [point_feature_from_row(row) for row in rows],
+        }
+    finally:
+        connection.close()
+
+
+def fetch_analysis_observations(
+    descriptor: DatasetDescriptor,
+    *,
+    state_name: str | None,
+    lga_name: str | None,
+    ward_key: str | None,
+) -> dict[str, Any]:
+    connection = connect_with_runtime_tables(descriptor)
+
+    try:
+        params: list[Any] = []
+        filters = [
+            "latitude is not null",
+            "longitude is not null",
+            "gps_quality_flag not in ('missing', 'invalid', 'outside_nigeria')",
+        ]
+
+        if state_name and state_name != "all":
+            filters.append("state_name = ?")
+            params.append(state_name)
+
+        if lga_name and lga_name != "all":
+            filters.append("lga_name = ?")
+            params.append(lga_name)
+
+        if ward_key:
+            filters.append(
+                "concat_ws('::', coalesce(state_name, ''), coalesce(lga_name, ''), coalesce(ward_name, '')) = ?"
+            )
+            params.append(ward_key)
+
+        where_clause = " and ".join(filters)
+        rows = connection.execute(
+            f"""
+            select
+              record_id,
+              cast(event_ts as varchar) as event_ts,
+              cast(submission_ts as varchar) as submission_ts,
+              cast(starttime as varchar) as starttime,
+              cast(endtime as varchar) as endtime,
+              cast(survey_date as varchar) as survey_date,
+              state_name,
+              lga_name,
+              ward_code,
+              ward_name,
+              collector_name,
+              device_id,
+              business_name,
+              outlet_type,
+              product_category_codes_raw,
+              channel_type,
+              visit_status,
+              interview_status_label,
+              review_state,
+              latitude,
+              longitude,
+              gps_accuracy,
+              gps_quality_flag,
+              effective_tolerance_m
+            from gps_events_clean
+            where {where_clause}
+            order by event_ts asc, record_id asc
+            """,
+            params,
+        ).fetchall()
+
+        return {
+            "type": "FeatureCollection",
+            "features": [point_feature_from_row(row) for row in rows],
+        }
+    finally:
+        connection.close()
+
+
+def fetch_map_tile(
+    descriptor: DatasetDescriptor,
+    z_value: int,
+    x_value: int,
+    y_value: int,
+    state_name: str | None,
+    lga_name: str | None,
+    coverage_status: str | None,
+) -> bytes:
+    west, south, east, north = _tile_bounds(z_value, x_value, y_value)
+    connection = connect_with_runtime_tables(descriptor)
+
+    try:
+        params: list[Any] = [west, east, south, north]
+        filters = [
+            "points.longitude between ? and ?",
+            "points.latitude between ? and ?",
+            "points.gps_quality_flag not in ('missing', 'invalid', 'outside_nigeria')",
+        ]
+
+        if state_name and state_name != "all":
+            filters.append("points.state_name = ?")
+            params.append(state_name)
+
+        if lga_name and lga_name != "all":
+            filters.append("points.lga_name = ?")
+            params.append(lga_name)
+
+        if coverage_status and coverage_status != "all":
+            filters.append("coverage.coverage_status = ?")
+            params.append(coverage_status)
+
+        where_clause = " and ".join(filters)
+        rows = connection.execute(
+            f"""
+            select
+              points.record_id,
+              points.visit_status,
+              points.latitude,
+              points.longitude
+            from gps_events_clean as points
+            left join ward_coverage_summary as coverage
+              on points.state_name = coverage.state_name
+             and points.lga_name = coverage.lga_name
+             and points.ward_name = coverage.ward_name
+            where {where_clause}
+            """,
+            params,
+        ).fetchall()
+
+        tile_features = _build_point_tile_features(
+            rows,
+            z_value=z_value,
+            x_value=x_value,
+            y_value=y_value,
+        )
+
+        return encode_point_tile(tile_features)
+    finally:
+        connection.close()
+
+
+class ApiHandler(BaseHTTPRequestHandler):
+    server_version = "DuckDbDashboardAPI/1.0"
+
+    def do_OPTIONS(self) -> None:
+        try:
+            self.send_response(HTTPStatus.NO_CONTENT)
+            self._send_default_headers()
+            self.end_headers()
+        except OSError as error:
+            if not is_client_disconnect_error(error):
+                raise
+
+    def do_GET(self) -> None:
+        parsed_url = urlparse(self.path)
+        path = parsed_url.path.rstrip("/") or "/"
+
+        try:
+            if path == "/api/health":
+                self._send_json({"ok": True})
+                return
+
+            if path == "/api/datasets":
+                self._send_json(STORE.get_manifest())
+                return
+
+            if path == "/api/dashboard":
+                query = parse_qs(parsed_url.query)
+                dataset_id = query.get("dataset", [None])[0]
+                include_geometry = query.get("includeGeometry", ["1"])[0] != "0"
+                include_observations = query.get("includeObservations", ["1"])[0] != "0"
+                self._send_json(
+                    STORE.get_dashboard(
+                        dataset_id,
+                        include_geometry=include_geometry,
+                        include_observations=include_observations,
+                    )
+                )
+                return
+
+            if path == "/api/outlet-analysis":
+                query = parse_qs(parsed_url.query)
+                dataset_id = query.get("dataset", [None])[0]
+                state_name = query.get("state", [None])[0]
+                lga_name = query.get("lga", [None])[0]
+                ward_key = query.get("wardKey", [None])[0]
+                category_name = query.get("category", [None])[0]
+                outlet_type = query.get("outletType", [None])[0]
+                outlet_types_text = query.get("outletTypes", [None])[0]
+                outlet_types = (
+                    [
+                        value.strip()
+                        for value in outlet_types_text.split(",")
+                        if value and value.strip()
+                    ]
+                    if outlet_types_text
+                    else None
+                )
+                active_descriptor = resolve_active_descriptor(dataset_id)
+                self._send_json(
+                    fetch_outlet_analysis(
+                        active_descriptor,
+                        state_name=state_name,
+                        lga_name=lga_name,
+                        ward_key=ward_key,
+                        category_name=category_name,
+                        outlet_type=outlet_type,
+                        outlet_types=outlet_types,
+                    )
+                )
+                return
+
+            if path == "/api/map-points":
+                query = parse_qs(parsed_url.query)
+                dataset_id = query.get("dataset", [None])[0]
+                bbox_text = query.get("bbox", [None])[0]
+                zoom_text = query.get("zoom", ["6"])[0]
+                state_name = query.get("state", [None])[0]
+                lga_name = query.get("lga", [None])[0]
+
+                if not bbox_text:
+                    self._send_json(
+                        {"error": "Missing bbox query parameter"},
+                        status=HTTPStatus.BAD_REQUEST,
+                    )
+                    return
+
+                try:
+                    bbox = tuple(float(value) for value in bbox_text.split(","))
+                    if len(bbox) != 4:
+                        raise ValueError
+                except ValueError:
+                    self._send_json(
+                        {"error": "bbox must be west,south,east,north"},
+                        status=HTTPStatus.BAD_REQUEST,
+                    )
+                    return
+
+                try:
+                    zoom = float(zoom_text)
+                except ValueError:
+                    zoom = 6.0
+
+                active_descriptor = resolve_active_descriptor(dataset_id)
+                self._send_json(
+                    fetch_map_points(
+                        active_descriptor,
+                        bbox=bbox,
+                        zoom=zoom,
+                        state_name=state_name,
+                        lga_name=lga_name,
+                    )
+                )
+                return
+
+            if path == "/api/analysis-observations":
+                query = parse_qs(parsed_url.query)
+                dataset_id = query.get("dataset", [None])[0]
+                state_name = query.get("state", [None])[0]
+                lga_name = query.get("lga", [None])[0]
+                ward_key = query.get("wardKey", [None])[0]
+                active_descriptor = resolve_active_descriptor(dataset_id)
+                self._send_json(
+                    fetch_analysis_observations(
+                        active_descriptor,
+                        state_name=state_name,
+                        lga_name=lga_name,
+                        ward_key=ward_key,
+                    )
+                )
+                return
+
+            if path.startswith("/api/tiles/") and path.endswith(".mvt"):
+                query = parse_qs(parsed_url.query)
+                dataset_id = query.get("dataset", [None])[0]
+                state_name = query.get("state", [None])[0]
+                lga_name = query.get("lga", [None])[0]
+                coverage_status = query.get("coverageStatus", [None])[0]
+                tile_parts = path.split("/")
+                if len(tile_parts) != 6:
+                    self._send_json(
+                        {"error": "Tile path must be /api/tiles/{z}/{x}/{y}.mvt"},
+                        status=HTTPStatus.BAD_REQUEST,
+                    )
+                    return
+
+                try:
+                    z_value = int(tile_parts[3])
+                    x_value = int(tile_parts[4])
+                    y_value = int(tile_parts[5].removesuffix(".mvt"))
+                except ValueError:
+                    self._send_json(
+                        {"error": "Invalid tile coordinates"},
+                        status=HTTPStatus.BAD_REQUEST,
+                    )
+                    return
+
+                active_descriptor = resolve_active_descriptor(dataset_id)
+                try:
+                    tile_payload = fetch_map_tile(
+                        active_descriptor,
+                        z_value=z_value,
+                        x_value=x_value,
+                        y_value=y_value,
+                        state_name=state_name,
+                        lga_name=lga_name,
+                        coverage_status=coverage_status,
+                    )
+                except Exception as error:
+                    print(
+                        "Tile generation failed:",
+                        {
+                            "dataset": active_descriptor.id,
+                            "z": z_value,
+                            "x": x_value,
+                            "y": y_value,
+                            "state": state_name,
+                            "lga": lga_name,
+                            "coverageStatus": coverage_status,
+                            "error": str(error),
+                        },
+                        file=sys.stderr,
+                    )
+                    traceback.print_exc()
+                    tile_payload = encode_point_tile([])
+
+                self._send_bytes(
+                    tile_payload,
+                    content_type="application/vnd.mapbox-vector-tile",
+                )
+                return
+
+            self._send_json(
+                {"error": f"Unknown endpoint: {path}"},
+                status=HTTPStatus.NOT_FOUND,
+            )
+        except FileNotFoundError as error:
+            if is_client_disconnect_error(error):
+                return
+            self._send_json({"error": str(error)}, status=HTTPStatus.NOT_FOUND)
+        except Exception as error:  # pragma: no cover - defensive handler
+            if is_client_disconnect_error(error):
+                return
+            self._send_json(
+                {"error": str(error)},
+                status=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+
+    def log_message(self, format: str, *args: Any) -> None:
+        return
+
+    def _send_default_headers(self) -> None:
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+
+    def _send_json(self, payload: dict[str, Any], status: HTTPStatus = HTTPStatus.OK) -> None:
+        body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        try:
+            self.send_response(status)
+            self._send_default_headers()
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except OSError as error:
+            if not is_client_disconnect_error(error):
+                raise
+
+    def _send_bytes(
+        self,
+        payload: bytes,
+        *,
+        content_type: str,
+        status: HTTPStatus = HTTPStatus.OK,
+    ) -> None:
+        body = payload
+        accepts_gzip = "gzip" in (self.headers.get("Accept-Encoding", "").lower())
+        if accepts_gzip and payload:
+            body = gzip.compress(payload, compresslevel=6)
+
+        try:
+            self.send_response(status)
+            self._send_default_headers()
+            self.send_header("Content-Type", content_type)
+            if body is not payload:
+                self.send_header("Content-Encoding", "gzip")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except OSError as error:
+            if not is_client_disconnect_error(error):
+                raise
+
+
+def warm_default_api_caches() -> None:
+    descriptors, _ = STORE._discover_datasets()
+    for descriptor in descriptors:
+        try:
+            STORE.get_dashboard(
+                dataset_id=descriptor.id,
+                include_geometry=True,
+                include_observations=False,
+            )
+            fetch_outlet_analysis(
+                descriptor,
+                state_name=None,
+                lga_name=None,
+                ward_key=None,
+                category_name=None,
+                outlet_type=None,
+                outlet_types=None,
+            )
+        except Exception:
+            continue
+
+
+def warm_primary_api_cache() -> None:
+    descriptors, _ = STORE._discover_datasets()
+    if not descriptors:
+        return
+
+    descriptor = descriptors[0]
+    try:
+        STORE.get_dashboard(
+            dataset_id=descriptor.id,
+            include_geometry=True,
+            include_observations=False,
+        )
+        fetch_outlet_analysis(
+            descriptor,
+            state_name=None,
+            lga_name=None,
+            ward_key=None,
+            category_name=None,
+            outlet_type=None,
+            outlet_types=None,
+        )
+    except Exception:
+        return
+
+
+def main() -> None:
+    host = os.environ.get("DUCKDB_DASHBOARD_HOST", "0.0.0.0")
+    port = int(os.environ.get("DUCKDB_DASHBOARD_PORT", "8000"))
+    warm_primary_api_cache()
+    server = ThreadingHTTPServer((host, port), ApiHandler)
+    print(f"DuckDB dashboard API listening on http://{host}:{port}")
+    Thread(target=warm_default_api_caches, daemon=True).start()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("DuckDB dashboard API stopped.")
+    finally:
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()
