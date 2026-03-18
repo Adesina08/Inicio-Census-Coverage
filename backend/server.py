@@ -588,17 +588,47 @@ def is_client_disconnect_error(error: BaseException) -> bool:
 
 def connect_with_runtime_tables(descriptor: DatasetDescriptor) -> duckdb.DuckDBPyConnection:
     connection = duckdb.connect(str(descriptor.source_path), read_only=True)
+    configure_duckdb_connection(connection, descriptor)
     if builder.runtime_tables_are_current(connection):
         return connection
 
     connection.close()
     connection = duckdb.connect(str(descriptor.source_path), read_only=False)
+    configure_duckdb_connection(connection, descriptor)
     builder.ensure_runtime_dataset_tables(connection, force_rebuild=True)
     return connection
 
 
 def _sql_string_literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
+
+
+def configure_duckdb_connection(
+    connection: duckdb.DuckDBPyConnection,
+    descriptor: DatasetDescriptor,
+) -> None:
+    temp_directory = Path(
+        os.environ.get(
+            "DUCKDB_TEMP_DIRECTORY",
+            str(descriptor.source_path.parent / ".duckdb_tmp"),
+        )
+    )
+    temp_directory.mkdir(parents=True, exist_ok=True)
+
+    memory_limit = os.environ.get("DUCKDB_MEMORY_LIMIT", "256MB")
+    max_temp_directory_size = os.environ.get(
+        "DUCKDB_MAX_TEMP_DIRECTORY_SIZE",
+        "10GiB",
+    )
+    threads = os.environ.get("DUCKDB_THREADS", "1")
+
+    connection.execute(f"SET temp_directory={_sql_string_literal(str(temp_directory))}")
+    connection.execute(
+        f"SET max_temp_directory_size={_sql_string_literal(max_temp_directory_size)}"
+    )
+    connection.execute(f"SET memory_limit={_sql_string_literal(memory_limit)}")
+    connection.execute(f"SET threads={threads}")
+    connection.execute("SET preserve_insertion_order=false")
 
 
 def _normalized_sql_text(column_name: str) -> str:
