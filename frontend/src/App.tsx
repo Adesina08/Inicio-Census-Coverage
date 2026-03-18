@@ -614,6 +614,7 @@ export default function App() {
   const [outletAnalysis, setOutletAnalysis] = useState<OutletAnalysisData | null>(null)
   const [mapPoints, setMapPoints] = useState<MapPointFeature[]>([])
   const [showStartupLoading, setShowStartupLoading] = useState(true)
+  const [isStartupReady, setIsStartupReady] = useState(false)
   const [loadingProgress, setLoadingProgress] = useState(0)
   const [loadingProgressTarget, setLoadingProgressTarget] = useState(0)
   const [loadingPhaseLabel, setLoadingPhaseLabel] = useState('Preparing dashboard structure.')
@@ -688,7 +689,7 @@ export default function App() {
       return
     }
 
-    if (!dashboard || loadError || loadingProgress < 100) {
+    if (!isStartupReady || loadError || loadingProgress < 100) {
       return
     }
 
@@ -700,13 +701,16 @@ export default function App() {
     return () => {
       window.clearTimeout(timeoutId)
     }
-  }, [dashboard, loadError, loadingProgress])
+  }, [isStartupReady, loadError, loadingProgress])
 
   useEffect(() => {
     let ignore = false
     const isInitialLoad = !hasCompletedInitialLoadRef.current
 
     setLoadError(null)
+    if (isInitialLoad) {
+      setIsStartupReady(false)
+    }
     const requestedDatasetId = selectedDatasetId || undefined
     const cachedDashboard = peekDashboardData(requestedDatasetId)
     const defaultOutletScope = {
@@ -865,11 +869,13 @@ export default function App() {
           setIsAnalysisLoading(false)
           setIsOutletAnalysisLoading(false)
         })
+        setIsStartupReady(true)
       } catch (error: unknown) {
         if (ignore) {
           return
         }
 
+        setIsStartupReady(false)
         setIsDatasetLoading(false)
         setIsAnalysisLoading(false)
         setIsOutletAnalysisLoading(false)
