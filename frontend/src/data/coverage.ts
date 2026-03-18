@@ -400,7 +400,9 @@ export function buildOutletAnalysisCacheKey(params: {
         searchParams.set('outletType', outletType)
       }
     } else {
-      searchParams.set('outletTypes', normalizedOutletTypes.join(','))
+      for (const outletType of normalizedOutletTypes) {
+        searchParams.append('outletTypes', outletType)
+      }
     }
   } else if (params.outletType && params.outletType !== 'all') {
     searchParams.set('outletType', params.outletType)

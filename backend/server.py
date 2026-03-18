@@ -1673,16 +1673,14 @@ class ApiHandler(BaseHTTPRequestHandler):
                 ward_key = query.get("wardKey", [None])[0]
                 category_name = query.get("category", [None])[0]
                 outlet_type = query.get("outletType", [None])[0]
-                outlet_types_text = query.get("outletTypes", [None])[0]
-                outlet_types = (
-                    [
-                        value.strip()
-                        for value in outlet_types_text.split(",")
-                        if value and value.strip()
-                    ]
-                    if outlet_types_text
-                    else None
-                )
+                outlet_types_values = query.get("outletTypes", [])
+                normalized_outlet_types: list[str] = []
+                for raw_value in outlet_types_values:
+                    for split_value in raw_value.split(","):
+                        cleaned_value = split_value.strip()
+                        if cleaned_value:
+                            normalized_outlet_types.append(cleaned_value)
+                outlet_types = normalized_outlet_types or None
                 active_descriptor = resolve_active_descriptor(dataset_id)
                 self._send_json(
                     fetch_outlet_analysis(
