@@ -2149,7 +2149,7 @@ export default function App() {
     }
   }, [activeWard, activeWardAnalysisPoints, dashboard, focusMode])
 
-  if ((!dashboard || showStartupLoading) && !loadError) {
+  if (showStartupLoading && !loadError) {
     return (
       <main className="dashboard-shell dashboard-shell--loading">
         <section className="loading-panel">
@@ -2181,7 +2181,7 @@ export default function App() {
           <img className="loading-panel__logo" src="/infinity-logo.png" alt="Infinity logo" />
           <span className="panel-eyebrow">Load failure</span>
           <h1>Dashboard data could not be loaded.</h1>
-          <p>{loadError}</p>
+          <p>{loadError ?? 'The startup loader completed, but the dashboard payload is still unavailable.'}</p>
         </section>
       </main>
     )
