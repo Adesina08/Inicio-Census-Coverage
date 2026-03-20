@@ -238,8 +238,7 @@ class DashboardStore:
 STORE = DashboardStore()
 OUTLET_ANALYSIS_CACHE_LOCK = Lock()
 OUTLET_ANALYSIS_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
-DUCKDB_TEMP_DIRECTORY_LOCK = Lock()
-ACTIVE_DUCKDB_TEMP_DIRECTORY: str | None = None
+RUNTIME_TABLE_CONNECTION_LOCK = Lock()
 PRODUCT_CATEGORY_ITEMS = sorted(
     builder.PRODUCT_CATEGORY_LABELS.items(),
     key=lambda item: int(item[0]),
@@ -654,36 +653,60 @@ def is_client_disconnect_error(error: BaseException) -> bool:
 
 
 def connect_with_runtime_tables(descriptor: DatasetDescriptor) -> duckdb.DuckDBPyConnection:
-    connection = duckdb.connect(str(descriptor.source_path), read_only=True)
-    configure_duckdb_connection(connection, descriptor)
-    if builder.runtime_tables_are_current(connection):
-        return connection
+    with RUNTIME_TABLE_CONNECTION_LOCK:
+        connection = duckdb.connect(str(descriptor.source_path), read_only=True)
+        configure_duckdb_connection(connection, descriptor)
+        if builder.runtime_tables_are_current(connection):
+            return connection
 
-    connection.close()
-    connection = duckdb.connect(str(descriptor.source_path), read_only=False)
-    configure_duckdb_connection(connection, descriptor)
-    builder.ensure_runtime_dataset_tables(connection, force_rebuild=True)
-    return connection
+        connection.close()
+        connection = duckdb.connect(str(descriptor.source_path), read_only=False)
+        configure_duckdb_connection(connection, descriptor)
+        builder.ensure_runtime_dataset_tables(connection, force_rebuild=True)
+        return connection
 
 
 def _sql_string_literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+def _resolve_duckdb_temp_directory(descriptor: DatasetDescriptor) -> Path:
+    raw_value = os.environ.get("DUCKDB_TEMP_DIRECTORY", "")
+    cleaned_value = raw_value.strip()
+
+    while (
+        len(cleaned_value) >= 2
+        and cleaned_value[0] == cleaned_value[-1]
+        and cleaned_value[0] in {"'", '"'}
+    ):
+        cleaned_value = cleaned_value[1:-1].strip()
+
+    cleaned_value = cleaned_value.replace('\\"', '"').replace("\\'", "'")
+    cleaned_value = cleaned_value.replace('"', "").replace("'", "").strip()
+
+    fallback_directory = descriptor.source_path.parent / ".duckdb_tmp"
+    candidate_directory = Path(cleaned_value) if cleaned_value else fallback_directory
+    if cleaned_value in {".", ".."}:
+        candidate_directory = fallback_directory
+    if os.name == "nt" and cleaned_value.startswith(("\\", "/")):
+        candidate_directory = fallback_directory
+
+    try:
+        resolved_directory = candidate_directory.resolve()
+        if os.name == "nt" and str(resolved_directory).startswith("\\\\"):
+            raise OSError("Rejecting malformed DuckDB temp directory")
+        resolved_directory.mkdir(parents=True, exist_ok=True)
+        return resolved_directory
+    except OSError:
+        fallback_directory.mkdir(parents=True, exist_ok=True)
+        return fallback_directory.resolve()
+
+
 def configure_duckdb_connection(
     connection: duckdb.DuckDBPyConnection,
     descriptor: DatasetDescriptor,
 ) -> None:
-    global ACTIVE_DUCKDB_TEMP_DIRECTORY
-
-    temp_directory = Path(
-        os.environ.get(
-            "DUCKDB_TEMP_DIRECTORY",
-            str(descriptor.source_path.parent / ".duckdb_tmp"),
-        )
-    )
-    temp_directory.mkdir(parents=True, exist_ok=True)
-    temp_directory_text = str(temp_directory.resolve())
+    temp_directory_text = str(_resolve_duckdb_temp_directory(descriptor))
 
     memory_limit = os.environ.get("DUCKDB_MEMORY_LIMIT", "256MB")
     max_temp_directory_size = os.environ.get(
@@ -692,11 +715,7 @@ def configure_duckdb_connection(
     )
     threads = os.environ.get("DUCKDB_THREADS", "1")
 
-    with DUCKDB_TEMP_DIRECTORY_LOCK:
-        if ACTIVE_DUCKDB_TEMP_DIRECTORY != temp_directory_text:
-            connection.execute(f"SET temp_directory={_sql_string_literal(temp_directory_text)}")
-            ACTIVE_DUCKDB_TEMP_DIRECTORY = temp_directory_text
-
+    connection.execute(f"SET temp_directory={_sql_string_literal(temp_directory_text)}")
     connection.execute(
         f"SET max_temp_directory_size={_sql_string_literal(max_temp_directory_size)}"
     )
@@ -750,28 +769,38 @@ def _build_outlet_scope_filters(
     category_name: str | None = None,
     outlet_type: str | None = None,
     outlet_types: list[str] | None = None,
+    state_column: str = "state_name",
+    lga_column: str = "lga_name",
+    ward_key_expression: str | None = None,
+    category_column: str | None = None,
+    outlet_type_column: str = "outlet_type",
 ) -> tuple[list[str], list[Any]]:
     filters = ["1 = 1"]
     params: list[Any] = []
+    ward_key_expression = ward_key_expression or _ward_key_sql()
 
     if state_name and state_name != "all":
-        filters.append("state_name = ?")
+        filters.append(f"{state_column} = ?")
         params.append(state_name)
 
     if lga_name and lga_name != "all":
-        filters.append("lga_name = ?")
+        filters.append(f"{lga_column} = ?")
         params.append(lga_name)
 
     if ward_key:
-        filters.append(f"{_ward_key_sql()} = ?")
+        filters.append(f"{ward_key_expression} = ?")
         params.append(ward_key)
 
     if category_name and category_name != "all":
-        category_code = CATEGORY_CODE_BY_LABEL.get(category_name)
-        if category_code:
-            filters.append(_product_category_match_sql("product_category_codes_raw", category_code))
+        if category_column is not None:
+            filters.append(f"{category_column} = ?")
+            params.append(category_name)
         else:
-            filters.append("1 = 0")
+            category_code = CATEGORY_CODE_BY_LABEL.get(category_name)
+            if category_code:
+                filters.append(_product_category_match_sql("product_category_codes_raw", category_code))
+            else:
+                filters.append("1 = 0")
 
     normalized_outlet_types = [
         value.strip()
@@ -780,7 +809,7 @@ def _build_outlet_scope_filters(
     ]
     if normalized_outlet_types:
         placeholders = ", ".join("?" for _ in normalized_outlet_types)
-        filters.append(f"{_normalized_sql_text('outlet_type')} in ({placeholders})")
+        filters.append(f"{_normalized_sql_text(outlet_type_column)} in ({placeholders})")
         params.extend(normalized_outlet_types)
 
     return filters, params
@@ -1089,8 +1118,6 @@ def fetch_outlet_analysis(
     connection = connect_with_runtime_tables(descriptor)
 
     try:
-        source_table_name = "gps_events_clean"
-
         option_filters, option_params = _build_outlet_scope_filters(
             state_name=state_name,
             lga_name=lga_name,
@@ -1109,52 +1136,39 @@ def fetch_outlet_analysis(
             outlet_type=outlet_type,
             outlet_types=outlet_types,
         )
-
-        _materialize_outlet_scope(
-            connection,
-            table_name="outlet_option_scope",
-            source_table_name=source_table_name,
-            filters=option_filters,
-            params=option_params,
+        option_category_filters, option_category_params = _build_outlet_scope_filters(
+            state_name=state_name,
+            lga_name=lga_name,
+            ward_key_expression="ward_key",
+            category_column="category_name",
         )
-        _materialize_outlet_scope(
-            connection,
-            table_name="outlet_analysis_scope",
-            source_table_name=source_table_name,
-            filters=analysis_filters,
-            params=analysis_params,
+        analysis_category_filters, analysis_category_params = _build_outlet_scope_filters(
+            state_name=state_name,
+            lga_name=lga_name,
+            ward_key=ward_key,
+            category_name=category_name,
+            ward_key_expression="ward_key",
+            category_column="category_name",
         )
-        _materialize_outlet_scope(
-            connection,
-            table_name="outlet_filtered_scope",
-            source_table_name=source_table_name,
-            filters=filtered_filters,
-            params=filtered_params,
+        filtered_category_filters, filtered_category_params = _build_outlet_scope_filters(
+            state_name=state_name,
+            lga_name=lga_name,
+            ward_key=ward_key,
+            category_name=category_name,
+            outlet_type=outlet_type,
+            outlet_types=outlet_types,
+            ward_key_expression="ward_key",
+            category_column="category_name",
         )
-        _materialize_outlet_category_scope(
-            connection,
-            table_name="outlet_option_category_scope",
-            source_table_name="outlet_option_scope",
-        )
-        _materialize_outlet_category_scope(
-            connection,
-            table_name="outlet_analysis_category_scope",
-            source_table_name="outlet_analysis_scope",
-        )
-        _materialize_outlet_category_scope(
-            connection,
-            table_name="outlet_filtered_category_scope",
-            source_table_name="outlet_filtered_scope",
-        )
-        _materialize_outlet_subcategory_scope(
-            connection,
-            table_name="outlet_analysis_subcategory_scope",
-            source_table_name="outlet_analysis_scope",
-        )
-        _materialize_outlet_subcategory_scope(
-            connection,
-            table_name="outlet_filtered_subcategory_scope",
-            source_table_name="outlet_filtered_scope",
+        filtered_subcategory_filters, filtered_subcategory_params = _build_outlet_scope_filters(
+            state_name=state_name,
+            lga_name=lga_name,
+            ward_key=ward_key,
+            category_name=category_name,
+            outlet_type=outlet_type,
+            outlet_types=outlet_types,
+            ward_key_expression="ward_key",
+            category_column="category_name",
         )
 
         state_options = [
@@ -1162,7 +1176,7 @@ def fetch_outlet_analysis(
             for row in connection.execute(
                 f"""
                 select distinct state_name
-                from {source_table_name}
+                from gps_events_clean
                 where nullif(trim(coalesce(state_name, '')), '') is not null
                 order by state_name asc
                 """
@@ -1173,33 +1187,39 @@ def fetch_outlet_analysis(
             for row in connection.execute(
                 f"""
                 select distinct lga_name
-                from outlet_option_scope
-                where nullif(trim(coalesce(lga_name, '')), '') is not null
+                from gps_events_clean
+                where {' and '.join(option_filters)}
+                  and nullif(trim(coalesce(lga_name, '')), '') is not null
                 order by lga_name asc
-                """
+                """,
+                option_params,
             ).fetchall()
         ]
         category_options = [
             row[0]
             for row in connection.execute(
-                """
+                f"""
                 select distinct category_name
-                from outlet_option_category_scope
-                where category_name <> 'No category recorded'
+                from outlet_category_clean
+                where {' and '.join(option_category_filters)}
+                  and category_name <> 'No category recorded'
                 order by category_name asc
-                """
+                """,
+                option_category_params,
             ).fetchall()
         ]
 
         scope_record_count = int(
             connection.execute(
-                "select count(*) from outlet_analysis_scope",
+                f"select count(*) from gps_events_clean where {' and '.join(analysis_filters)}",
+                analysis_params,
             ).fetchone()[0]
             or 0
         )
         filtered_record_count = int(
             connection.execute(
-                "select count(*) from outlet_filtered_scope",
+                f"select count(*) from gps_events_clean where {' and '.join(filtered_filters)}",
+                filtered_params,
             ).fetchone()[0]
             or 0
         )
@@ -1213,24 +1233,28 @@ def fetch_outlet_analysis(
               sum(case when visit_status = 'Observation' then 1 else 0 end) as observation_count,
               count(distinct state_name) as state_count,
               count(distinct concat_ws('::', coalesce(state_name, ''), coalesce(lga_name, ''))) as lga_count,
-              count(distinct ward_key) as ward_count
-            from outlet_analysis_scope
+              count(distinct {_ward_key_sql()}) as ward_count
+            from gps_events_clean
+            where {' and '.join(analysis_filters)}
             group by 1
             order by 2 desc, 1 asc
-            """
+            """,
+            analysis_params,
         ).fetchall()
         outlet_type_category_rows = [
             (str(outlet_type_name), str(category_name), int(record_count or 0))
             for outlet_type_name, category_name, record_count in connection.execute(
-                """
+                f"""
                 select
                   outlet_type,
                   category_name,
                   count(*) as record_count
-                from outlet_analysis_category_scope
+                from outlet_category_clean
+                where {' and '.join(analysis_category_filters)}
                 group by 1, 2
                 order by 1 asc, 3 desc, 2 asc
-                """
+                """,
+                analysis_category_params,
             ).fetchall()
         ]
 
@@ -1252,8 +1276,8 @@ def fetch_outlet_analysis(
                 state_count,
                 lga_count,
                 ward_count,
-            ) in connection.execute(
-                """
+             ) in connection.execute(
+                f"""
                 select
                   category_name,
                   count(*) as record_count,
@@ -1262,10 +1286,12 @@ def fetch_outlet_analysis(
                   count(distinct state_name) as state_count,
                   count(distinct concat_ws('::', coalesce(state_name, ''), coalesce(lga_name, ''))) as lga_count,
                   count(distinct ward_key) as ward_count
-                from outlet_filtered_category_scope
+                from outlet_category_clean
+                where {' and '.join(filtered_category_filters)}
                 group by 1
                 order by 2 desc, 1 asc
-                """
+                """,
+                filtered_category_params,
             ).fetchall()
         ]
 
@@ -1335,7 +1361,7 @@ def fetch_outlet_analysis(
             ) in category_rows
         ]
         subcategory_rows = connection.execute(
-            """
+            f"""
             select
               category_name,
               subcategory_name,
@@ -1345,10 +1371,12 @@ def fetch_outlet_analysis(
               count(distinct state_name) as state_count,
               count(distinct concat_ws('::', coalesce(state_name, ''), coalesce(lga_name, ''))) as lga_count,
               count(distinct ward_key) as ward_count
-            from outlet_filtered_subcategory_scope
+            from outlet_subcategory_clean
+            where {' and '.join(filtered_subcategory_filters)}
             group by 1, 2
             order by 3 desc, 1 asc, 2 asc
-            """
+            """,
+            filtered_subcategory_params,
         ).fetchall()
         outlet_subcategory_rows = [
             {

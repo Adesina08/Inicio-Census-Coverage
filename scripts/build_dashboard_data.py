@@ -43,7 +43,7 @@ MAX_GPS_TOLERANCE_METERS = 25
 NEAR_TARGET_PERCENT = 80
 WELL_COVERED_PERCENT = 85
 MAX_FRONTEND_OBSERVATIONS = 50_000
-RUNTIME_SCHEMA_VERSION = 7
+RUNTIME_SCHEMA_VERSION = 8
 SUBCATEGORY_MAPPING_CSV_PATH = Path.home() / "Downloads" / "Categories_Subcat_PROPER.csv"
 
 PRODUCT_CATEGORY_LABELS = {
@@ -313,6 +313,35 @@ def build_lga_key(state_name: Any, lga_name: Any) -> str:
             normalize_admin_value(state_name),
             normalize_admin_value(lga_name),
         ]
+    )
+
+
+def _normalized_admin_sql(column_name: str) -> str:
+    base_expression = (
+        "regexp_replace("
+        f"replace(lower(trim(coalesce({column_name}, ''))), '&', 'and'), "
+        "'[^a-z0-9]+', '', 'g'"
+        ")"
+    )
+    return f"""
+        case {base_expression}
+          when 'fct' then 'federalcapitalterritory'
+          when 'federalcapitalterritoryabuja' then 'federalcapitalterritory'
+          when 'municipalareacouncil' then 'amac'
+          when 'portharcourt' then 'portharcourtcity'
+          when 'ifakoijaye' then 'ifakoijaiye'
+          else {base_expression}
+        end
+    """
+
+
+def _ward_key_sql() -> str:
+    return (
+        "concat_ws('::', "
+        f"{_normalized_admin_sql('state_name')}, "
+        f"{_normalized_admin_sql('lga_name')}, "
+        f"{_normalized_admin_sql('ward_name')}"
+        ")"
     )
 
 
@@ -1788,6 +1817,8 @@ def runtime_tables_are_current(connection: duckdb.DuckDBPyConnection) -> bool:
     required_tables = {
         "gps_events_clean",
         "gps_events_deduped",
+        "outlet_category_clean",
+        "outlet_subcategory_clean",
         "ward_coverage_summary",
         "runtime_metadata",
     }
@@ -1852,6 +1883,7 @@ def ensure_runtime_dataset_tables(
         scored_points_by_ward_key,
     )
     persist_ward_coverage_summary(connection, coverage_rows)
+    persist_outlet_analysis_runtime_tables(connection)
     persist_runtime_metadata(connection)
 
 
@@ -1884,6 +1916,136 @@ def persist_ward_coverage_summary(
         """,
         coverage_rows,
     )
+
+
+def persist_outlet_analysis_runtime_tables(connection: duckdb.DuckDBPyConnection) -> None:
+    connection.execute("drop table if exists outlet_category_clean")
+    category_mapping_rows_sql = ",\n              ".join(
+        "('{}', '{}')".format(code, label.replace("'", "''"))
+        for code, label in PRODUCT_CATEGORY_LABELS.items()
+    )
+    connection.execute(
+        f"""
+        create table outlet_category_clean as
+        with exploded_categories as (
+          select
+            state_name,
+            lga_name,
+            ward_name,
+            {_ward_key_sql()} as ward_key,
+            coalesce(nullif(trim(coalesce(outlet_type, '')), ''), 'Unknown') as outlet_type,
+            visit_status,
+            category_code
+          from gps_events_clean,
+          unnest(regexp_split_to_array(trim(coalesce(product_category_codes_raw, '')), '\\s+')) as split_codes(category_code)
+          where nullif(trim(coalesce(product_category_codes_raw, '')), '') is not null
+            and nullif(trim(category_code), '') is not null
+
+          union all
+
+          select
+            state_name,
+            lga_name,
+            ward_name,
+            {_ward_key_sql()} as ward_key,
+            coalesce(nullif(trim(coalesce(outlet_type, '')), ''), 'Unknown') as outlet_type,
+            visit_status,
+            null as category_code
+          from gps_events_clean
+          where nullif(trim(coalesce(product_category_codes_raw, '')), '') is null
+        ),
+        category_mapping(category_code, category_name) as (
+          values
+              {category_mapping_rows_sql}
+        )
+        select
+          exploded_categories.state_name,
+          exploded_categories.lga_name,
+          exploded_categories.ward_name,
+          exploded_categories.ward_key,
+          exploded_categories.outlet_type,
+          exploded_categories.visit_status,
+          coalesce(
+            category_mapping.category_name,
+            case
+              when exploded_categories.category_code is null then 'No category recorded'
+              else exploded_categories.category_code
+            end
+          ) as category_name
+        from exploded_categories
+        left join category_mapping
+          on exploded_categories.category_code = category_mapping.category_code
+        """
+    )
+
+    connection.execute("drop table if exists outlet_subcategory_clean")
+    connection.execute("drop table if exists outlet_subcategory_label_map")
+    connection.execute(
+        """
+        create table outlet_subcategory_label_map (
+          category_name varchar,
+          subcategory_code varchar,
+          subcategory_name varchar
+        )
+        """
+    )
+    proper_labels = load_subcategory_proper_labels()
+    if proper_labels:
+        connection.executemany(
+            "insert into outlet_subcategory_label_map values (?, ?, ?)",
+            [
+                (category_name, subcategory_code, subcategory_name)
+                for (category_name, subcategory_code), subcategory_name in proper_labels.items()
+            ],
+        )
+
+    union_parts: list[str] = []
+    for definition in OUTLET_SUBCATEGORY_GROUPS:
+        field_alias = str(definition["fieldAlias"])
+        category_name = str(definition["categoryLabel"]).replace("'", "''")
+        union_parts.append(
+            f"""
+            select
+              state_name,
+              lga_name,
+              ward_name,
+              {_ward_key_sql()} as ward_key,
+              coalesce(nullif(trim(coalesce(outlet_type, '')), ''), 'Unknown') as outlet_type,
+              visit_status,
+              '{category_name}' as category_name,
+              subcategory_code
+            from gps_events_clean,
+            unnest(regexp_split_to_array(trim(coalesce({field_alias}, '')), '\\s+')) as split_codes(subcategory_code)
+            where nullif(trim(coalesce({field_alias}, '')), '') is not null
+              and nullif(trim(subcategory_code), '') is not null
+            """
+        )
+
+    connection.execute(
+        f"""
+        create table outlet_subcategory_clean as
+        with exploded_codes as (
+          {' union all '.join(union_parts)}
+        )
+        select
+          exploded_codes.state_name,
+          exploded_codes.lga_name,
+          exploded_codes.ward_name,
+          exploded_codes.ward_key,
+          exploded_codes.outlet_type,
+          exploded_codes.visit_status,
+          exploded_codes.category_name,
+          coalesce(
+            mapping.subcategory_name,
+            exploded_codes.category_name || ' option ' || exploded_codes.subcategory_code
+          ) as subcategory_name
+        from exploded_codes
+        left join outlet_subcategory_label_map as mapping
+          on exploded_codes.category_name = mapping.category_name
+         and exploded_codes.subcategory_code = mapping.subcategory_code
+        """
+    )
+    connection.execute("drop table if exists outlet_subcategory_label_map")
 
 
 def persist_runtime_metadata(connection: duckdb.DuckDBPyConnection) -> None:
@@ -2021,6 +2183,7 @@ def prepare_dataset_bundle(
             scored_points_by_ward_key,
         )
         persist_ward_coverage_summary(connection, coverage_rows)
+        persist_outlet_analysis_runtime_tables(connection)
         dashboard_summary = build_dashboard_summary(
             connection,
             observations_geojson,
