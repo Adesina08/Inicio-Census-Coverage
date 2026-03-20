@@ -1480,21 +1480,35 @@ export default function App() {
     }
   }, [outletAnalysisWardKey, outletAnalysisWardOptions])
 
-  const coverageScopedWards = allWardFeatures.filter((feature) => {
-    const matchesState =
-      selectedState === 'all' || feature.properties.stateName === selectedState
-    const matchesLga = selectedLga === 'all' || feature.properties.lgaName === selectedLga
-    const matchesCoverage =
-      selectedCoverageStatus === 'all' ||
-      feature.properties.coverageStatus === selectedCoverageStatus
+  const coverageScopedWards = useMemo(
+    () =>
+      allWardFeatures.filter((feature) => {
+        const matchesState =
+          selectedState === 'all' || feature.properties.stateName === selectedState
+        const matchesLga = selectedLga === 'all' || feature.properties.lgaName === selectedLga
+        const matchesCoverage =
+          selectedCoverageStatus === 'all' ||
+          feature.properties.coverageStatus === selectedCoverageStatus
 
-    return matchesState && matchesLga && matchesCoverage
-  })
+        return matchesState && matchesLga && matchesCoverage
+      }),
+    [allWardFeatures, selectedCoverageStatus, selectedLga, selectedState],
+  )
 
-  const wardsWithGps = coverageScopedWards.filter(hasWardObservations)
-  const scopedWardKeys = new Set(coverageScopedWards.map((feature) => feature.properties.wardKey))
-  const analysisScopePoints = allObservationFeatures.filter((feature) =>
-    scopedWardKeys.has(feature.properties.wardKey),
+  const wardsWithGps = useMemo(
+    () => coverageScopedWards.filter(hasWardObservations),
+    [coverageScopedWards],
+  )
+  const scopedWardKeys = useMemo(
+    () => new Set(coverageScopedWards.map((feature) => feature.properties.wardKey)),
+    [coverageScopedWards],
+  )
+  const analysisScopePoints = useMemo(
+    () =>
+      allObservationFeatures.filter((feature) =>
+        scopedWardKeys.has(feature.properties.wardKey),
+      ),
+    [allObservationFeatures, scopedWardKeys],
   )
 
   useEffect(() => {
@@ -2079,29 +2093,45 @@ export default function App() {
 
   useEffect(() => {
     if (!dashboard || focusMode === 'overview' || !activeWard) {
-      setMapPoints([])
-      setIsMapPointsLoading(false)
+      if (mapPoints.length > 0) {
+        setMapPoints([])
+      }
+      if (isMapPointsLoading) {
+        setIsMapPointsLoading(false)
+      }
       return
     }
 
     if (activeWardAnalysisPoints.length > 0) {
-      startTransition(() => {
-        setMapPoints(activeWardAnalysisPoints)
+      if (mapPoints !== activeWardAnalysisPoints) {
+        startTransition(() => {
+          setMapPoints(activeWardAnalysisPoints)
+        })
+      }
+      if (isMapPointsLoading) {
         setIsMapPointsLoading(false)
-      })
+      }
       return
     }
 
     if (activeWard.properties.rawObservationCount <= 0) {
-      setMapPoints([])
-      setIsMapPointsLoading(false)
+      if (mapPoints.length > 0) {
+        setMapPoints([])
+      }
+      if (isMapPointsLoading) {
+        setIsMapPointsLoading(false)
+      }
       return
     }
 
     const detailBounds = getFeatureBounds(activeWard)
     if (!detailBounds) {
-      setMapPoints([])
-      setIsMapPointsLoading(false)
+      if (mapPoints.length > 0) {
+        setMapPoints([])
+      }
+      if (isMapPointsLoading) {
+        setIsMapPointsLoading(false)
+      }
       return
     }
 
@@ -2143,7 +2173,14 @@ export default function App() {
       ignore = true
       window.clearTimeout(timeoutId)
     }
-  }, [activeWard, activeWardAnalysisPoints, dashboard, focusMode])
+  }, [
+    activeWard,
+    activeWardAnalysisPoints,
+    dashboard,
+    focusMode,
+    isMapPointsLoading,
+    mapPoints,
+  ])
 
   if (showStartupLoading && !loadError) {
     return (
