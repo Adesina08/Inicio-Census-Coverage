@@ -751,10 +751,8 @@ export default function App() {
     setMapPoints([])
 
     if (cachedDashboard) {
-      startTransition(() => {
-        setDashboard(cachedDashboard)
-        setLoadError(null)
-      })
+      setDashboard(cachedDashboard)
+      setLoadError(null)
     } else if (!isFullyCached) {
       setLoadingProgressTarget(12)
     }
@@ -771,10 +769,8 @@ export default function App() {
           return
         }
 
-        startTransition(() => {
-          setDashboard(nextDashboard)
-          setLoadError(null)
-        })
+        setDashboard(nextDashboard)
+        setLoadError(null)
 
         if (ignore) {
           return
