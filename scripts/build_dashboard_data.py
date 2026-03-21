@@ -43,7 +43,7 @@ MAX_GPS_TOLERANCE_METERS = 25
 NEAR_TARGET_PERCENT = 80
 WELL_COVERED_PERCENT = 85
 MAX_FRONTEND_OBSERVATIONS = 50_000
-RUNTIME_SCHEMA_VERSION = 8
+RUNTIME_SCHEMA_VERSION = 9
 SUBCATEGORY_MAPPING_CSV_PATH = Path.home() / "Downloads" / "Categories_Subcat_PROPER.csv"
 
 PRODUCT_CATEGORY_LABELS = {
@@ -1887,8 +1887,11 @@ def runtime_tables_are_current(connection: duckdb.DuckDBPyConnection) -> bool:
     required_tables = {
         "gps_events_clean",
         "gps_events_deduped",
+        "outlet_scope_summary",
         "outlet_category_clean",
+        "outlet_category_scope_summary",
         "outlet_subcategory_clean",
+        "outlet_subcategory_scope_summary",
         "ward_coverage_summary",
         "runtime_metadata",
     }
@@ -1989,6 +1992,23 @@ def persist_ward_coverage_summary(
 
 
 def persist_outlet_analysis_runtime_tables(connection: duckdb.DuckDBPyConnection) -> None:
+    connection.execute("drop table if exists outlet_scope_summary")
+    connection.execute(
+        f"""
+        create table outlet_scope_summary as
+        select
+          state_name,
+          lga_name,
+          {_ward_key_sql()} as ward_key,
+          coalesce(nullif(trim(coalesce(outlet_type, '')), ''), 'Unknown') as outlet_type,
+          count(*) as record_count,
+          sum(case when visit_status = 'Completed' then 1 else 0 end) as completed_count,
+          sum(case when visit_status = 'Observation' then 1 else 0 end) as observation_count
+        from gps_events_clean
+        group by 1, 2, 3, 4
+        """
+    )
+
     connection.execute("drop table if exists outlet_category_clean")
     category_mapping_rows_sql = ",\n              ".join(
         "('{}', '{}')".format(code, label.replace("'", "''"))
@@ -2045,6 +2065,24 @@ def persist_outlet_analysis_runtime_tables(connection: duckdb.DuckDBPyConnection
         from exploded_categories
         left join category_mapping
           on exploded_categories.category_code = category_mapping.category_code
+        """
+    )
+
+    connection.execute("drop table if exists outlet_category_scope_summary")
+    connection.execute(
+        """
+        create table outlet_category_scope_summary as
+        select
+          state_name,
+          lga_name,
+          ward_key,
+          outlet_type,
+          category_name,
+          count(*) as record_count,
+          sum(case when visit_status = 'Completed' then 1 else 0 end) as completed_count,
+          sum(case when visit_status = 'Observation' then 1 else 0 end) as observation_count
+        from outlet_category_clean
+        group by 1, 2, 3, 4, 5
         """
     )
 
@@ -2113,6 +2151,24 @@ def persist_outlet_analysis_runtime_tables(connection: duckdb.DuckDBPyConnection
         left join outlet_subcategory_label_map as mapping
           on exploded_codes.category_name = mapping.category_name
          and exploded_codes.subcategory_code = mapping.subcategory_code
+        """
+    )
+    connection.execute("drop table if exists outlet_subcategory_scope_summary")
+    connection.execute(
+        """
+        create table outlet_subcategory_scope_summary as
+        select
+          state_name,
+          lga_name,
+          ward_key,
+          outlet_type,
+          category_name,
+          subcategory_name,
+          count(*) as record_count,
+          sum(case when visit_status = 'Completed' then 1 else 0 end) as completed_count,
+          sum(case when visit_status = 'Observation' then 1 else 0 end) as observation_count
+        from outlet_subcategory_clean
+        group by 1, 2, 3, 4, 5, 6
         """
     )
     connection.execute("drop table if exists outlet_subcategory_label_map")

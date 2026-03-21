@@ -10,6 +10,8 @@ import type { FeatureCollection, Point, Polygon } from 'geojson'
 import {
   buildOutletAnalysisCacheKey,
   buildPointTileUrl,
+  deriveFilteredCategoryRows,
+  deriveFilteredSubcategoryRows,
   hasWardObservations,
   loadAnalysisObservations,
   loadDashboardData,
@@ -140,7 +142,6 @@ type OutletAnalysisScope = {
   stateName: string
   lgaName: string
   wardKey: string
-  outletTypes: string[]
 }
 
 function normalizeOutletTypeSelection(values: string[]) {
@@ -153,6 +154,14 @@ function normalizeOutletTypeSelection(values: string[]) {
   }
 
   return normalized.sort((first, second) => first.localeCompare(second))
+}
+
+function hasRawOutletAnalysisBreakdown(data: OutletAnalysisData | null) {
+  if (!data) {
+    return false
+  }
+
+  return data.rawCategoryRows.length > 0 || data.rawSubcategoryRows.length > 0
 }
 
 const numberFormatter = new Intl.NumberFormat('en-US')
@@ -588,13 +597,7 @@ function SelectField({
 }
 
 function hasDefaultOutletAnalysisScope(scope: OutletAnalysisScope) {
-  return (
-    scope.stateName === 'all' &&
-    scope.lgaName === 'all' &&
-    scope.wardKey === '' &&
-    scope.outletTypes.length === 1 &&
-    scope.outletTypes[0] === 'all'
-  )
+  return scope.stateName === 'all' && scope.lgaName === 'all' && scope.wardKey === ''
 }
 
 export default function App() {
@@ -607,7 +610,6 @@ export default function App() {
     stateName: 'all',
     lgaName: 'all',
     wardKey: '',
-    outletTypes: ['all'],
   })
   const [dashboard, setDashboard] = useState<DashboardData | null>(null)
   const [analysisObservations, setAnalysisObservations] = useState<ObservationFeature[]>([])
@@ -649,11 +651,9 @@ export default function App() {
       stateName: outletAnalysisState,
       lgaName: outletAnalysisLga,
       wardKey: outletAnalysisWardKey,
-      outletTypes: outletAnalysisOutletTypes,
     }
   }, [
     outletAnalysisLga,
-    outletAnalysisOutletTypes,
     outletAnalysisState,
     outletAnalysisWardKey,
   ])
@@ -717,7 +717,6 @@ export default function App() {
       datasetId: requestedDatasetId,
       stateName: 'all',
       lgaName: 'all',
-      outletTypes: ['all'],
     } as const
     const cachedAnalysis = peekAnalysisObservations({ datasetId: requestedDatasetId })
     const cachedOutletAnalysis = peekOutletAnalysis(defaultOutletScope)
@@ -1001,12 +1000,26 @@ export default function App() {
       return
     }
 
-    const outletScope = {
+    const baseOutletScope = {
       datasetId: dashboard.activeDataset.id,
       stateName: outletAnalysisState,
       lgaName: outletAnalysisLga,
       wardKey: outletAnalysisWardKey || undefined,
-      outletTypes: outletAnalysisOutletTypes,
+    } as const
+    const cachedBaseOutletAnalysis = peekOutletAnalysis(baseOutletScope)
+    const isAllOutletTypesSelected =
+      outletAnalysisOutletTypes.length === 0 ||
+      (outletAnalysisOutletTypes.length === 1 && outletAnalysisOutletTypes[0] === 'all')
+    const outletTypesForServer = !isAllOutletTypesSelected && !hasRawOutletAnalysisBreakdown(cachedBaseOutletAnalysis)
+      ? outletAnalysisOutletTypes
+      : undefined
+
+    // Prefer instant client-side outlet-type filtering when the payload includes
+    // raw per-outlet-type breakdown rows. Fall back to server-side filtering for
+    // older payloads that only include pre-aggregated rows.
+    const outletScope = {
+      ...baseOutletScope,
+      outletTypes: outletTypesForServer,
     } as const
     const requestKey = buildOutletAnalysisCacheKey(outletScope)
     const cachedOutletAnalysis = peekOutletAnalysis(outletScope)
@@ -1021,9 +1034,7 @@ export default function App() {
     let ignore = false
     setIsOutletAnalysisLoading(true)
 
-    loadOutletAnalysis({
-      ...outletScope,
-    })
+    loadOutletAnalysis({ ...outletScope })
       .then((payload) => {
         if (
           ignore ||
@@ -1067,7 +1078,6 @@ export default function App() {
       datasetId: activeDatasetId,
       stateName: 'all',
       lgaName: 'all',
-      outletTypes: ['all'],
     } as const
 
     const cachedAnalysis = peekAnalysisObservations({ datasetId: activeDatasetId })
@@ -1170,7 +1180,6 @@ export default function App() {
               datasetId: dataset.id,
               stateName: 'all',
               lgaName: 'all',
-              outletTypes: ['all'],
             })
           ) {
             try {
@@ -1285,13 +1294,23 @@ export default function App() {
       })
   }, [allWardFeatures, outletAnalysisLga, outletAnalysisState])
   const outletTypeRows: OutletTypeAnalysisRow[] = outletAnalysis?.outletTypeRows ?? []
-  const outletCategoryRows: OutletCategoryAnalysisRow[] =
-    outletAnalysis?.outletCategoryRows ?? []
+  const outletCategoryRows: OutletCategoryAnalysisRow[] = useMemo(
+    () =>
+      outletAnalysis
+        ? deriveFilteredCategoryRows(outletAnalysis, outletAnalysisOutletTypes)
+        : [],
+    [outletAnalysis, outletAnalysisOutletTypes],
+  )
   const supportsSubcategoryAnalysis =
     outletAnalysis == null ||
     Object.prototype.hasOwnProperty.call(outletAnalysis, 'outletSubcategoryRows')
-  const outletSubcategoryRows: OutletSubcategoryAnalysisRow[] =
-    outletAnalysis?.outletSubcategoryRows ?? []
+  const outletSubcategoryRows: OutletSubcategoryAnalysisRow[] = useMemo(
+    () =>
+      outletAnalysis
+        ? deriveFilteredSubcategoryRows(outletAnalysis, outletAnalysisOutletTypes)
+        : [],
+    [outletAnalysis, outletAnalysisOutletTypes],
+  )
   const outletAnalysisScopeRecordCount = outletAnalysis?.scopeRecordCount ?? 0
   const outletAnalysisFilteredRecordCount =
     outletAnalysis?.filteredRecordCount ?? outletAnalysisScopeRecordCount
@@ -1315,6 +1334,8 @@ export default function App() {
       : supportsSubcategoryAnalysis
         ? 'No outlet sub categories in the current outlet-analysis scope.'
         : 'Sub category analysis is unavailable from the current backend response. Restart the backend and refresh the page.'
+  const shouldKeepOutletAnalysisStageStable =
+    isOutletAnalysisLoading || hasOutletAnalysisRows
   const outletAnalysisTableContent =
     outletAnalysisGranularity === 'category' ? (
       <table className="analysis-table analysis-table--outlet">
@@ -3122,10 +3143,14 @@ export default function App() {
         </div>
 
         <div className="analysis-table-shell">
-          {!hasOutletAnalysisRows ? (
+          {!shouldKeepOutletAnalysisStageStable ? (
             <div className="analysis-empty">{outletAnalysisEmptyMessage}</div>
           ) : (
-            outletAnalysisView === 'table' ? (
+            <>
+              {isOutletAnalysisLoading ? (
+                <div className="analysis-loading-overlay">Updating outlet analysis…</div>
+              ) : null}
+              {outletAnalysisView === 'table' ? (
               <div className="analysis-table-scroll">
                 {outletAnalysisTableContent}
               </div>
@@ -3149,7 +3174,8 @@ export default function App() {
                   </div>
                 */}
               </>
-            )
+              )}
+            </>
           )}
         </div>
       </section>

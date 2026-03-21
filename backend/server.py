@@ -239,6 +239,20 @@ STORE = DashboardStore()
 OUTLET_ANALYSIS_CACHE_LOCK = Lock()
 OUTLET_ANALYSIS_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
 RUNTIME_TABLE_CONNECTION_LOCK = Lock()
+# Serializes concurrent fetch_outlet_analysis calls per dataset to prevent
+# DuckDB write-write conflicts when multiple requests try to create/modify
+# temporary tables simultaneously on the same database file.
+_OUTLET_ANALYSIS_EXECUTION_LOCKS: dict[str, Lock] = {}
+_OUTLET_ANALYSIS_EXECUTION_LOCKS_LOCK = Lock()
+
+
+def _get_outlet_analysis_execution_lock(descriptor_id: str) -> Lock:
+    with _OUTLET_ANALYSIS_EXECUTION_LOCKS_LOCK:
+        if descriptor_id not in _OUTLET_ANALYSIS_EXECUTION_LOCKS:
+            _OUTLET_ANALYSIS_EXECUTION_LOCKS[descriptor_id] = Lock()
+        return _OUTLET_ANALYSIS_EXECUTION_LOCKS[descriptor_id]
+
+
 PRODUCT_CATEGORY_ITEMS = sorted(
     builder.PRODUCT_CATEGORY_LABELS.items(),
     key=lambda item: int(item[0]),
@@ -299,7 +313,12 @@ def load_prebuilt_outlet_analysis_payload(
         return None
 
     try:
-        return json.loads(outlet_analysis_path.read_text(encoding="utf-8"))
+        payload = json.loads(outlet_analysis_path.read_text(encoding="utf-8"))
+        # Reject prebuilt payloads that predate rawCategoryRows so the server
+        # recomputes a fresh payload that includes the new fields.
+        if "rawCategoryRows" not in payload:
+            return None
+        return payload
     except (OSError, json.JSONDecodeError):
         return None
 
@@ -1112,315 +1131,433 @@ def fetch_outlet_analysis(
     )
     with OUTLET_ANALYSIS_CACHE_LOCK:
         cached_payload = OUTLET_ANALYSIS_CACHE.get(cache_key)
+        # Discard stale cache entries that predate rawCategoryRows.
+        if cached_payload is not None and "rawCategoryRows" not in cached_payload:
+            cached_payload = None
+            del OUTLET_ANALYSIS_CACHE[cache_key]
         if cached_payload is not None:
             return cached_payload
 
-    connection = connect_with_runtime_tables(descriptor)
+    # Serialize DB access per dataset. DuckDB does not support concurrent
+    # writers on the same file — rapid multi-select clicks can fire several
+    # requests simultaneously, all trying to open a read_only=False connection
+    # to create temporary tables, which causes IOException / 502 errors.
+    # Requests that arrive while one is running will wait here, then hit the
+    # cache on the double-check below and return immediately without re-querying.
+    execution_lock = _get_outlet_analysis_execution_lock(descriptor.id)
+    with execution_lock:
+        with OUTLET_ANALYSIS_CACHE_LOCK:
+            cached_payload = OUTLET_ANALYSIS_CACHE.get(cache_key)
+            if cached_payload is not None and "rawCategoryRows" not in cached_payload:
+                cached_payload = None
+                del OUTLET_ANALYSIS_CACHE[cache_key]
+            if cached_payload is not None:
+                return cached_payload
 
-    try:
-        option_filters, option_params = _build_outlet_scope_filters(
-            state_name=state_name,
-            lga_name=lga_name,
-        )
-        analysis_filters, analysis_params = _build_outlet_scope_filters(
-            state_name=state_name,
-            lga_name=lga_name,
-            ward_key=ward_key,
-            category_name=category_name,
-        )
-        filtered_filters, filtered_params = _build_outlet_scope_filters(
-            state_name=state_name,
-            lga_name=lga_name,
-            ward_key=ward_key,
-            category_name=category_name,
-            outlet_type=outlet_type,
-            outlet_types=outlet_types,
-        )
-        option_category_filters, option_category_params = _build_outlet_scope_filters(
-            state_name=state_name,
-            lga_name=lga_name,
-            ward_key_expression="ward_key",
-            category_column="category_name",
-        )
-        analysis_category_filters, analysis_category_params = _build_outlet_scope_filters(
-            state_name=state_name,
-            lga_name=lga_name,
-            ward_key=ward_key,
-            category_name=category_name,
-            ward_key_expression="ward_key",
-            category_column="category_name",
-        )
-        filtered_category_filters, filtered_category_params = _build_outlet_scope_filters(
-            state_name=state_name,
-            lga_name=lga_name,
-            ward_key=ward_key,
-            category_name=category_name,
-            outlet_type=outlet_type,
-            outlet_types=outlet_types,
-            ward_key_expression="ward_key",
-            category_column="category_name",
-        )
-        filtered_subcategory_filters, filtered_subcategory_params = _build_outlet_scope_filters(
-            state_name=state_name,
-            lga_name=lga_name,
-            ward_key=ward_key,
-            category_name=category_name,
-            outlet_type=outlet_type,
-            outlet_types=outlet_types,
-            ward_key_expression="ward_key",
-            category_column="category_name",
-        )
+        connection = connect_with_runtime_tables(descriptor)
 
-        state_options = [
-            row[0]
-            for row in connection.execute(
-                f"""
-                select distinct state_name
-                from gps_events_clean
-                where nullif(trim(coalesce(state_name, '')), '') is not null
-                order by state_name asc
-                """
-            ).fetchall()
-        ]
-        lga_options = [
-            row[0]
-            for row in connection.execute(
-                f"""
-                select distinct lga_name
-                from gps_events_clean
-                where {' and '.join(option_filters)}
-                  and nullif(trim(coalesce(lga_name, '')), '') is not null
-                order by lga_name asc
-                """,
-                option_params,
-            ).fetchall()
-        ]
-        category_options = [
-            row[0]
-            for row in connection.execute(
-                f"""
-                select distinct category_name
-                from outlet_category_clean
-                where {' and '.join(option_category_filters)}
-                  and category_name <> 'No category recorded'
-                order by category_name asc
-                """,
-                option_category_params,
-            ).fetchall()
-        ]
+        try:
+            option_filters, option_params = _build_outlet_scope_filters(
+                state_name=state_name,
+                lga_name=lga_name,
+            )
+            analysis_filters, analysis_params = _build_outlet_scope_filters(
+                state_name=state_name,
+                lga_name=lga_name,
+                ward_key=ward_key,
+                category_name=category_name,
+                ward_key_expression="ward_key",
+            )
+            filtered_filters, filtered_params = _build_outlet_scope_filters(
+                state_name=state_name,
+                lga_name=lga_name,
+                ward_key=ward_key,
+                category_name=category_name,
+                outlet_type=outlet_type,
+                outlet_types=outlet_types,
+                ward_key_expression="ward_key",
+            )
+            option_category_filters, option_category_params = _build_outlet_scope_filters(
+                state_name=state_name,
+                lga_name=lga_name,
+                ward_key_expression="ward_key",
+                category_column="category_name",
+            )
+            analysis_category_filters, analysis_category_params = _build_outlet_scope_filters(
+                state_name=state_name,
+                lga_name=lga_name,
+                ward_key=ward_key,
+                category_name=category_name,
+                ward_key_expression="ward_key",
+                category_column="category_name",
+            )
+            filtered_category_filters, filtered_category_params = _build_outlet_scope_filters(
+                state_name=state_name,
+                lga_name=lga_name,
+                ward_key=ward_key,
+                category_name=category_name,
+                outlet_type=outlet_type,
+                outlet_types=outlet_types,
+                ward_key_expression="ward_key",
+                category_column="category_name",
+            )
+            filtered_subcategory_filters, filtered_subcategory_params = _build_outlet_scope_filters(
+                state_name=state_name,
+                lga_name=lga_name,
+                ward_key=ward_key,
+                category_name=category_name,
+                outlet_type=outlet_type,
+                outlet_types=outlet_types,
+                ward_key_expression="ward_key",
+                category_column="category_name",
+            )
 
-        scope_record_count = int(
-            connection.execute(
-                f"select count(*) from gps_events_clean where {' and '.join(analysis_filters)}",
-                analysis_params,
-            ).fetchone()[0]
-            or 0
-        )
-        filtered_record_count = int(
-            connection.execute(
-                f"select count(*) from gps_events_clean where {' and '.join(filtered_filters)}",
-                filtered_params,
-            ).fetchone()[0]
-            or 0
-        )
+            state_options = [
+                row[0]
+                for row in connection.execute(
+                    f"""
+                    select distinct state_name
+                    from outlet_scope_summary
+                    where nullif(trim(coalesce(state_name, '')), '') is not null
+                    order by state_name asc
+                    """
+                ).fetchall()
+            ]
+            lga_options = [
+                row[0]
+                for row in connection.execute(
+                    f"""
+                    select distinct lga_name
+                    from outlet_scope_summary
+                    where {' and '.join(option_filters)}
+                      and nullif(trim(coalesce(lga_name, '')), '') is not null
+                    order by lga_name asc
+                    """,
+                    option_params,
+                ).fetchall()
+            ]
+            category_options = [
+                row[0]
+                for row in connection.execute(
+                    f"""
+                    select distinct category_name
+                    from outlet_category_scope_summary
+                    where {' and '.join(option_category_filters)}
+                      and category_name <> 'No category recorded'
+                    order by category_name asc
+                    """,
+                    option_category_params,
+                ).fetchall()
+            ]
 
-        outlet_type_base_rows = connection.execute(
-            f"""
-            select
-              outlet_type,
-              count(*) as record_count,
-              sum(case when visit_status = 'Completed' then 1 else 0 end) as completed_count,
-              sum(case when visit_status = 'Observation' then 1 else 0 end) as observation_count,
-              count(distinct state_name) as state_count,
-              count(distinct concat_ws('::', coalesce(state_name, ''), coalesce(lga_name, ''))) as lga_count,
-              count(distinct {_ward_key_sql()}) as ward_count
-            from gps_events_clean
-            where {' and '.join(analysis_filters)}
-            group by 1
-            order by 2 desc, 1 asc
-            """,
-            analysis_params,
-        ).fetchall()
-        outlet_type_category_rows = [
-            (str(outlet_type_name), str(category_name), int(record_count or 0))
-            for outlet_type_name, category_name, record_count in connection.execute(
+            scope_record_count = int(
+                connection.execute(
+                    f"""
+                    select coalesce(sum(record_count), 0)
+                    from outlet_scope_summary
+                    where {' and '.join(analysis_filters)}
+                    """,
+                    analysis_params,
+                ).fetchone()[0]
+                or 0
+            )
+            filtered_record_count = int(
+                connection.execute(
+                    f"""
+                    select coalesce(sum(record_count), 0)
+                    from outlet_scope_summary
+                    where {' and '.join(filtered_filters)}
+                    """,
+                    filtered_params,
+                ).fetchone()[0]
+                or 0
+            )
+
+            outlet_type_base_rows = connection.execute(
                 f"""
                 select
                   outlet_type,
-                  category_name,
-                  count(*) as record_count
-                from outlet_category_clean
-                where {' and '.join(analysis_category_filters)}
-                group by 1, 2
-                order by 1 asc, 3 desc, 2 asc
+                  sum(record_count) as record_count,
+                  sum(completed_count) as completed_count,
+                  sum(observation_count) as observation_count,
+                  count(distinct state_name) as state_count,
+                  count(distinct concat_ws('::', coalesce(state_name, ''), coalesce(lga_name, ''))) as lga_count,
+                  count(distinct ward_key) as ward_count
+                from outlet_scope_summary
+                where {' and '.join(analysis_filters)}
+                group by 1
+                order by 2 desc, 1 asc
                 """,
-                analysis_category_params,
+                analysis_params,
             ).fetchall()
-        ]
+            outlet_type_category_rows = [
+                (str(outlet_type_name), str(category_name), int(record_count or 0))
+                for outlet_type_name, category_name, record_count in connection.execute(
+                    f"""
+                    select
+                      outlet_type,
+                      category_name,
+                      sum(record_count) as record_count
+                    from outlet_category_scope_summary
+                    where {' and '.join(analysis_category_filters)}
+                    group by 1, 2
+                    order by 1 asc, 3 desc, 2 asc
+                    """,
+                    analysis_category_params,
+                ).fetchall()
+            ]
 
-        category_rows = [
-            (
-                str(category_name),
-                int(record_count or 0),
-                int(completed_count or 0),
-                int(observation_count or 0),
-                int(state_count or 0),
-                int(lga_count or 0),
-                int(ward_count or 0),
-            )
+            category_rows = [
+                (
+                    str(category_name),
+                    int(record_count or 0),
+                    int(completed_count or 0),
+                    int(observation_count or 0),
+                    int(state_count or 0),
+                    int(lga_count or 0),
+                    int(ward_count or 0),
+                )
+                for (
+                    category_name,
+                    record_count,
+                    completed_count,
+                    observation_count,
+                    state_count,
+                    lga_count,
+                    ward_count,
+                 ) in connection.execute(
+                    f"""
+                    select
+                      category_name,
+                      sum(record_count) as record_count,
+                      sum(completed_count) as completed_count,
+                      sum(observation_count) as observation_count,
+                      count(distinct state_name) as state_count,
+                      count(distinct concat_ws('::', coalesce(state_name, ''), coalesce(lga_name, ''))) as lga_count,
+                      count(distinct ward_key) as ward_count
+                    from outlet_category_scope_summary
+                    where {' and '.join(filtered_category_filters)}
+                    group by 1
+                    order by 2 desc, 1 asc
+                    """,
+                    filtered_category_params,
+                ).fetchall()
+            ]
+
+            categories_by_outlet_type: dict[str, list[tuple[str, int]]] = {}
+            for outlet_type_name, category_label, record_count in outlet_type_category_rows:
+                categories_by_outlet_type.setdefault(str(outlet_type_name), []).append(
+                    (str(category_label), int(record_count or 0))
+                )
+
+            outlet_type_rows = []
             for (
-                category_name,
+                outlet_type_name,
                 record_count,
                 completed_count,
                 observation_count,
                 state_count,
                 lga_count,
                 ward_count,
-             ) in connection.execute(
-                f"""
-                select
-                  category_name,
-                  count(*) as record_count,
-                  sum(case when visit_status = 'Completed' then 1 else 0 end) as completed_count,
-                  sum(case when visit_status = 'Observation' then 1 else 0 end) as observation_count,
-                  count(distinct state_name) as state_count,
-                  count(distinct concat_ws('::', coalesce(state_name, ''), coalesce(lga_name, ''))) as lga_count,
-                  count(distinct ward_key) as ward_count
-                from outlet_category_clean
-                where {' and '.join(filtered_category_filters)}
-                group by 1
-                order by 2 desc, 1 asc
-                """,
-                filtered_category_params,
-            ).fetchall()
-        ]
+            ) in outlet_type_base_rows:
+                category_counts = categories_by_outlet_type.get(str(outlet_type_name), [])
+                categories_summary = ", ".join(
+                    f"{category_label} ({count})"
+                    for category_label, count in category_counts
+                )
+                outlet_type_rows.append(
+                    {
+                        "outletType": str(outlet_type_name),
+                        "count": int(record_count or 0),
+                        "completedCount": int(completed_count or 0),
+                        "observationCount": int(observation_count or 0),
+                        "sharePercent": (
+                            0
+                            if scope_record_count == 0
+                            else (int(record_count or 0) / scope_record_count) * 100
+                        ),
+                        "stateCount": int(state_count or 0),
+                        "lgaCount": int(lga_count or 0),
+                        "wardCount": int(ward_count or 0),
+                        "distinctCategoryCount": len(category_counts),
+                        "categoriesSummary": categories_summary,
+                    }
+                )
 
-        categories_by_outlet_type: dict[str, list[tuple[str, int]]] = {}
-        for outlet_type_name, category_label, record_count in outlet_type_category_rows:
-            categories_by_outlet_type.setdefault(str(outlet_type_name), []).append(
-                (str(category_label), int(record_count or 0))
-            )
-
-        outlet_type_rows = []
-        for (
-            outlet_type_name,
-            record_count,
-            completed_count,
-            observation_count,
-            state_count,
-            lga_count,
-            ward_count,
-        ) in outlet_type_base_rows:
-            category_counts = categories_by_outlet_type.get(str(outlet_type_name), [])
-            categories_summary = ", ".join(
-                f"{category_label} ({count})"
-                for category_label, count in category_counts
-            )
-            outlet_type_rows.append(
+            outlet_category_rows = [
                 {
-                    "outletType": str(outlet_type_name),
+                    "categoryName": str(category_label),
                     "count": int(record_count or 0),
                     "completedCount": int(completed_count or 0),
                     "observationCount": int(observation_count or 0),
                     "sharePercent": (
                         0
-                        if scope_record_count == 0
-                        else (int(record_count or 0) / scope_record_count) * 100
+                        if filtered_record_count == 0
+                        else (int(record_count or 0) / filtered_record_count) * 100
                     ),
                     "stateCount": int(state_count or 0),
                     "lgaCount": int(lga_count or 0),
                     "wardCount": int(ward_count or 0),
-                    "distinctCategoryCount": len(category_counts),
-                    "categoriesSummary": categories_summary,
                 }
-            )
+                for (
+                    category_label,
+                    record_count,
+                    completed_count,
+                    observation_count,
+                    state_count,
+                    lga_count,
+                    ward_count,
+                ) in category_rows
+            ]
+            subcategory_rows = connection.execute(
+                f"""
+                select
+                  category_name,
+                  subcategory_name,
+                  sum(record_count) as record_count,
+                  sum(completed_count) as completed_count,
+                  sum(observation_count) as observation_count,
+                  count(distinct state_name) as state_count,
+                  count(distinct concat_ws('::', coalesce(state_name, ''), coalesce(lga_name, ''))) as lga_count,
+                  count(distinct ward_key) as ward_count
+                from outlet_subcategory_scope_summary
+                where {' and '.join(filtered_subcategory_filters)}
+                group by 1, 2
+                order by 3 desc, 1 asc, 2 asc
+                """,
+                filtered_subcategory_params,
+            ).fetchall()
+            outlet_subcategory_rows = [
+                {
+                    "categoryName": str(category_name),
+                    "subcategoryName": str(subcategory_name),
+                    "count": int(record_count or 0),
+                    "completedCount": int(completed_count or 0),
+                    "observationCount": int(observation_count or 0),
+                    "sharePercent": (
+                        0
+                        if filtered_record_count == 0
+                        else (int(record_count or 0) / filtered_record_count) * 100
+                    ),
+                    "stateCount": int(state_count or 0),
+                    "lgaCount": int(lga_count or 0),
+                    "wardCount": int(ward_count or 0),
+                }
+                for (
+                    category_name,
+                    subcategory_name,
+                    record_count,
+                    completed_count,
+                    observation_count,
+                    state_count,
+                    lga_count,
+                    ward_count,
+                ) in subcategory_rows
+            ]
 
-        outlet_category_rows = [
-            {
-                "categoryName": str(category_label),
-                "count": int(record_count or 0),
-                "completedCount": int(completed_count or 0),
-                "observationCount": int(observation_count or 0),
-                "sharePercent": (
-                    0
-                    if filtered_record_count == 0
-                    else (int(record_count or 0) / filtered_record_count) * 100
-                ),
-                "stateCount": int(state_count or 0),
-                "lgaCount": int(lga_count or 0),
-                "wardCount": int(ward_count or 0),
-            }
-            for (
-                category_label,
-                record_count,
-                completed_count,
-                observation_count,
-                state_count,
-                lga_count,
-                ward_count,
-            ) in category_rows
-        ]
-        subcategory_rows = connection.execute(
-            f"""
-            select
-              category_name,
-              subcategory_name,
-              count(*) as record_count,
-              sum(case when visit_status = 'Completed' then 1 else 0 end) as completed_count,
-              sum(case when visit_status = 'Observation' then 1 else 0 end) as observation_count,
-              count(distinct state_name) as state_count,
-              count(distinct concat_ws('::', coalesce(state_name, ''), coalesce(lga_name, ''))) as lga_count,
-              count(distinct ward_key) as ward_count
-            from outlet_subcategory_clean
-            where {' and '.join(filtered_subcategory_filters)}
-            group by 1, 2
-            order by 3 desc, 1 asc, 2 asc
-            """,
-            filtered_subcategory_params,
-        ).fetchall()
-        outlet_subcategory_rows = [
-            {
-                "categoryName": str(category_name),
-                "subcategoryName": str(subcategory_name),
-                "count": int(record_count or 0),
-                "completedCount": int(completed_count or 0),
-                "observationCount": int(observation_count or 0),
-                "sharePercent": (
-                    0
-                    if filtered_record_count == 0
-                    else (int(record_count or 0) / filtered_record_count) * 100
-                ),
-                "stateCount": int(state_count or 0),
-                "lgaCount": int(lga_count or 0),
-                "wardCount": int(ward_count or 0),
-            }
-            for (
-                category_name,
-                subcategory_name,
-                record_count,
-                completed_count,
-                observation_count,
-                state_count,
-                lga_count,
-                ward_count,
-            ) in subcategory_rows
-        ]
+            # Raw per-outlet-type breakdowns used by the frontend for instant
+            # client-side filtering — no extra server round-trip needed when
+            # the user toggles outlet type buttons.
+            raw_category_rows = [
+                {
+                    "outletType": str(outlet_type_val),
+                    "categoryName": str(category_name),
+                    "count": int(record_count or 0),
+                    "completedCount": int(completed_count or 0),
+                    "observationCount": int(observation_count or 0),
+                    "stateCount": int(state_count or 0),
+                    "lgaCount": int(lga_count or 0),
+                    "wardCount": int(ward_count or 0),
+                }
+                for (
+                    outlet_type_val,
+                    category_name,
+                    record_count,
+                    completed_count,
+                    observation_count,
+                    state_count,
+                    lga_count,
+                    ward_count,
+                ) in connection.execute(
+                    f"""
+                    select
+                      outlet_type,
+                      category_name,
+                      sum(record_count) as record_count,
+                      sum(completed_count) as completed_count,
+                      sum(observation_count) as observation_count,
+                      count(distinct state_name) as state_count,
+                      count(distinct concat_ws('::', coalesce(state_name, ''), coalesce(lga_name, ''))) as lga_count,
+                      count(distinct ward_key) as ward_count
+                    from outlet_category_scope_summary
+                    where {' and '.join(analysis_category_filters)}
+                    group by 1, 2
+                    order by 1 asc, 3 desc, 2 asc
+                    """,
+                    analysis_category_params,
+                ).fetchall()
+            ]
 
-        payload = {
-            "stateOptions": state_options,
-            "lgaOptions": lga_options,
-            "categoryOptions": category_options,
-            "scopeRecordCount": scope_record_count,
-            "filteredRecordCount": filtered_record_count,
-            "outletTypeRows": outlet_type_rows,
-            "outletCategoryRows": outlet_category_rows,
-            "outletSubcategoryRows": outlet_subcategory_rows,
-        }
-        with OUTLET_ANALYSIS_CACHE_LOCK:
-            OUTLET_ANALYSIS_CACHE[cache_key] = payload
-        return payload
-    finally:
-        connection.close()
+            raw_subcategory_rows = [
+                {
+                    "outletType": str(outlet_type_val),
+                    "categoryName": str(category_name),
+                    "subcategoryName": str(subcategory_name),
+                    "count": int(record_count or 0),
+                    "completedCount": int(completed_count or 0),
+                    "observationCount": int(observation_count or 0),
+                    "stateCount": int(state_count or 0),
+                    "lgaCount": int(lga_count or 0),
+                    "wardCount": int(ward_count or 0),
+                }
+                for (
+                    outlet_type_val,
+                    category_name,
+                    subcategory_name,
+                    record_count,
+                    completed_count,
+                    observation_count,
+                    state_count,
+                    lga_count,
+                    ward_count,
+                ) in connection.execute(
+                    f"""
+                    select
+                      outlet_type,
+                      category_name,
+                      subcategory_name,
+                      sum(record_count) as record_count,
+                      sum(completed_count) as completed_count,
+                      sum(observation_count) as observation_count,
+                      count(distinct state_name) as state_count,
+                      count(distinct concat_ws('::', coalesce(state_name, ''), coalesce(lga_name, ''))) as lga_count,
+                      count(distinct ward_key) as ward_count
+                    from outlet_subcategory_scope_summary
+                    where {' and '.join(analysis_category_filters)}
+                    group by 1, 2, 3
+                    order by 1 asc, 4 desc, 2 asc, 3 asc
+                    """,
+                    analysis_category_params,
+                ).fetchall()
+            ]
+
+            payload = {
+                "stateOptions": state_options,
+                "lgaOptions": lga_options,
+                "categoryOptions": category_options,
+                "scopeRecordCount": scope_record_count,
+                "filteredRecordCount": filtered_record_count,
+                "outletTypeRows": outlet_type_rows,
+                "outletCategoryRows": outlet_category_rows,
+                "outletSubcategoryRows": outlet_subcategory_rows,
+                "rawCategoryRows": raw_category_rows,
+                "rawSubcategoryRows": raw_subcategory_rows,
+            }
+            with OUTLET_ANALYSIS_CACHE_LOCK:
+                OUTLET_ANALYSIS_CACHE[cache_key] = payload
+            return payload
+        finally:
+            connection.close()
 
 
 def point_feature_from_row(row: tuple[Any, ...]) -> dict[str, Any]:

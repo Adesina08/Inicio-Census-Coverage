@@ -130,6 +130,29 @@ export type OutletSubcategoryAnalysisRow = {
   wardCount: number
 }
 
+export type OutletCategoryRawRow = {
+  outletType: string
+  categoryName: string
+  count: number
+  completedCount: number
+  observationCount: number
+  stateCount: number
+  lgaCount: number
+  wardCount: number
+}
+
+export type OutletSubcategoryRawRow = {
+  outletType: string
+  categoryName: string
+  subcategoryName: string
+  count: number
+  completedCount: number
+  observationCount: number
+  stateCount: number
+  lgaCount: number
+  wardCount: number
+}
+
 export type OutletAnalysisData = {
   stateOptions: string[]
   lgaOptions: string[]
@@ -139,6 +162,8 @@ export type OutletAnalysisData = {
   outletTypeRows: OutletTypeAnalysisRow[]
   outletCategoryRows: OutletCategoryAnalysisRow[]
   outletSubcategoryRows: OutletSubcategoryAnalysisRow[]
+  rawCategoryRows: OutletCategoryRawRow[]
+  rawSubcategoryRows: OutletSubcategoryRawRow[]
 }
 
 export type DashboardSummary = {
@@ -290,6 +315,9 @@ function buildAnalysisObservationCacheKey(params: {
   return searchParams.toString() || resolveDashboardCacheKey(params.datasetId)
 }
 const outletAnalysisCache = new Map<string, OutletAnalysisData>()
+// Deduplicates concurrent requests for the same cache key so that rapid
+// multi-select clicks never fire more than one in-flight fetch at a time.
+const outletAnalysisInFlight = new Map<string, Promise<OutletAnalysisData>>()
 
 let geometryCache:
   | {
@@ -615,19 +643,43 @@ export async function loadOutletAnalysis(params: {
   outletTypes?: readonly string[]
 }): Promise<OutletAnalysisData> {
   const cacheKey = buildOutletAnalysisCacheKey(params)
-  const cached = outletAnalysisCache.get(cacheKey)
+  let cached = outletAnalysisCache.get(cacheKey)
   if (cached) {
+    // Patch stale cache entries that predate rawCategoryRows / rawSubcategoryRows.
+    if (!Array.isArray(cached.rawCategoryRows)) {
+      cached = { ...cached, rawCategoryRows: [], rawSubcategoryRows: [] }
+      outletAnalysisCache.set(cacheKey, cached)
+    }
     return cached
   }
 
+  // If an identical request is already in-flight (e.g. rapid multi-select
+  // clicks), share its promise instead of firing a second fetch to the server.
+  const existingRequest = outletAnalysisInFlight.get(cacheKey)
+  if (existingRequest) {
+    return existingRequest
+  }
+
   const query = cacheKey ? `?${cacheKey}` : ''
-  const payload = await fetchJson<OutletAnalysisData>(
+  const request = fetchJson<OutletAnalysisData>(
     `${API_BASE}/outlet-analysis${query}`,
     { timeoutMs: 60000 },
-  )
+  ).then((payload) => {
+    // Normalise payloads from older server builds that predate rawCategoryRows /
+    // rawSubcategoryRows so the rest of the code never sees undefined arrays.
+    if (!Array.isArray(payload.rawCategoryRows)) {
+      payload = { ...payload, rawCategoryRows: [], rawSubcategoryRows: [] }
+    }
+    outletAnalysisCache.set(cacheKey, payload)
+    outletAnalysisInFlight.delete(cacheKey)
+    return payload
+  }).catch((error) => {
+    outletAnalysisInFlight.delete(cacheKey)
+    throw error
+  })
 
-  outletAnalysisCache.set(cacheKey, payload)
-  return payload
+  outletAnalysisInFlight.set(cacheKey, request)
+  return request
 }
 
 export function buildPointTileUrl(params: {
@@ -656,4 +708,152 @@ export function buildPointTileUrl(params: {
 
 export function hasWardObservations(feature: WardFeature) {
   return feature.properties.observationCount > 0
+}
+
+/**
+ * Derives filtered + re-aggregated category rows from the raw per-outlet-type
+ * breakdown that the server includes in every payload. This runs entirely in
+ * memory so toggling outlet type buttons updates the table instantly with no
+ * network round-trip.
+ */
+export function deriveFilteredCategoryRows(
+  data: OutletAnalysisData,
+  selectedOutletTypes: readonly string[],
+): OutletCategoryAnalysisRow[] {
+  const isAll =
+    selectedOutletTypes.length === 0 ||
+    (selectedOutletTypes.length === 1 && selectedOutletTypes[0] === 'all')
+
+  // When all types are selected just return the pre-aggregated rows from the server.
+  if (isAll) {
+    return data.outletCategoryRows
+  }
+
+  // rawCategoryRows is absent in payloads cached before this update — fall back
+  // to the pre-aggregated rows so the UI never crashes on stale cache.
+  if (!data.rawCategoryRows) {
+    return data.outletCategoryRows
+  }
+
+  const selectedSet = new Set(selectedOutletTypes)
+  const filtered = data.rawCategoryRows.filter((r) => selectedSet.has(r.outletType))
+
+  // Aggregate across the selected outlet types per category.
+  const aggregated = new Map<
+    string,
+    { count: number; completedCount: number; observationCount: number; stateNames: Set<string>; lgaKeys: Set<string>; wardKeys: Set<string> }
+  >()
+
+  // We only have pre-aggregated counts per (outletType, category), not the
+  // raw event rows. stateCount/lgaCount/wardCount may overlap across outlet
+  // types so we can't sum them directly — instead we take the max as a safe
+  // lower-bound approximation when multiple types are selected.
+  for (const row of filtered) {
+    const existing = aggregated.get(row.categoryName)
+    if (!existing) {
+      aggregated.set(row.categoryName, {
+        count: row.count,
+        completedCount: row.completedCount,
+        observationCount: row.observationCount,
+        stateNames: new Set([String(row.stateCount)]),
+        lgaKeys: new Set([String(row.lgaCount)]),
+        wardKeys: new Set([String(row.wardCount)]),
+      })
+    } else {
+      existing.count += row.count
+      existing.completedCount += row.completedCount
+      existing.observationCount += row.observationCount
+      // Use max for geo counts since we can't de-duplicate across outlet types
+      existing.stateNames = new Set([String(Math.max(row.stateCount, Number([...existing.stateNames][0])))])
+      existing.lgaKeys = new Set([String(Math.max(row.lgaCount, Number([...existing.lgaKeys][0])))])
+      existing.wardKeys = new Set([String(Math.max(row.wardCount, Number([...existing.wardKeys][0])))])
+    }
+  }
+
+  const totalCount = [...aggregated.values()].reduce((sum, r) => sum + r.count, 0)
+
+  return [...aggregated.entries()]
+    .map(([categoryName, agg]) => ({
+      categoryName,
+      count: agg.count,
+      completedCount: agg.completedCount,
+      observationCount: agg.observationCount,
+      sharePercent: totalCount === 0 ? 0 : (agg.count / totalCount) * 100,
+      stateCount: Number([...agg.stateNames][0]),
+      lgaCount: Number([...agg.lgaKeys][0]),
+      wardCount: Number([...agg.wardKeys][0]),
+    }))
+    .sort((a, b) => b.count - a.count || a.categoryName.localeCompare(b.categoryName))
+}
+
+/**
+ * Same as deriveFilteredCategoryRows but for subcategory rows.
+ */
+export function deriveFilteredSubcategoryRows(
+  data: OutletAnalysisData,
+  selectedOutletTypes: readonly string[],
+): OutletSubcategoryAnalysisRow[] {
+  const isAll =
+    selectedOutletTypes.length === 0 ||
+    (selectedOutletTypes.length === 1 && selectedOutletTypes[0] === 'all')
+
+  if (isAll) {
+    return data.outletSubcategoryRows
+  }
+
+  // rawSubcategoryRows is absent in payloads cached before this update — fall back
+  // to the pre-aggregated rows so the UI never crashes on stale cache.
+  if (!data.rawSubcategoryRows) {
+    return data.outletSubcategoryRows
+  }
+
+  const selectedSet = new Set(selectedOutletTypes)
+  const filtered = data.rawSubcategoryRows.filter((r) => selectedSet.has(r.outletType))
+
+  const aggregated = new Map<
+    string,
+    { categoryName: string; count: number; completedCount: number; observationCount: number; maxState: number; maxLga: number; maxWard: number }
+  >()
+
+  for (const row of filtered) {
+    const key = `${row.categoryName}\0${row.subcategoryName}`
+    const existing = aggregated.get(key)
+    if (!existing) {
+      aggregated.set(key, {
+        categoryName: row.categoryName,
+        count: row.count,
+        completedCount: row.completedCount,
+        observationCount: row.observationCount,
+        maxState: row.stateCount,
+        maxLga: row.lgaCount,
+        maxWard: row.wardCount,
+      })
+    } else {
+      existing.count += row.count
+      existing.completedCount += row.completedCount
+      existing.observationCount += row.observationCount
+      existing.maxState = Math.max(existing.maxState, row.stateCount)
+      existing.maxLga = Math.max(existing.maxLga, row.lgaCount)
+      existing.maxWard = Math.max(existing.maxWard, row.wardCount)
+    }
+  }
+
+  const totalCount = [...aggregated.values()].reduce((sum, r) => sum + r.count, 0)
+
+  return [...aggregated.entries()]
+    .map(([key, agg]) => {
+      const subcategoryName = key.split('\0')[1]
+      return {
+        categoryName: agg.categoryName,
+        subcategoryName,
+        count: agg.count,
+        completedCount: agg.completedCount,
+        observationCount: agg.observationCount,
+        sharePercent: totalCount === 0 ? 0 : (agg.count / totalCount) * 100,
+        stateCount: agg.maxState,
+        lgaCount: agg.maxLga,
+        wardCount: agg.maxWard,
+      }
+    })
+    .sort((a, b) => b.count - a.count || a.categoryName.localeCompare(b.categoryName) || a.subcategoryName.localeCompare(b.subcategoryName))
 }
