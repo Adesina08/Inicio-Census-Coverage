@@ -810,6 +810,12 @@ def build_default_outlet_analysis_payload(connection: duckdb.DuckDBPyConnection)
     category_states: dict[str, set[str]] = {}
     category_lgas: dict[str, set[str]] = {}
     category_wards: dict[str, set[str]] = {}
+    raw_category_counts: Counter[tuple[str, str]] = Counter()
+    raw_category_completed: Counter[tuple[str, str]] = Counter()
+    raw_category_observation: Counter[tuple[str, str]] = Counter()
+    raw_category_states: dict[tuple[str, str], set[str]] = {}
+    raw_category_lgas: dict[tuple[str, str], set[str]] = {}
+    raw_category_wards: dict[tuple[str, str], set[str]] = {}
 
     subcategory_counts: Counter[tuple[str, str]] = Counter()
     subcategory_completed: Counter[tuple[str, str]] = Counter()
@@ -817,6 +823,12 @@ def build_default_outlet_analysis_payload(connection: duckdb.DuckDBPyConnection)
     subcategory_states: dict[tuple[str, str], set[str]] = {}
     subcategory_lgas: dict[tuple[str, str], set[str]] = {}
     subcategory_wards: dict[tuple[str, str], set[str]] = {}
+    raw_subcategory_counts: Counter[tuple[str, str, str]] = Counter()
+    raw_subcategory_completed: Counter[tuple[str, str, str]] = Counter()
+    raw_subcategory_observation: Counter[tuple[str, str, str]] = Counter()
+    raw_subcategory_states: dict[tuple[str, str, str], set[str]] = {}
+    raw_subcategory_lgas: dict[tuple[str, str, str], set[str]] = {}
+    raw_subcategory_wards: dict[tuple[str, str, str], set[str]] = {}
 
     for row in rows:
         (
@@ -859,10 +871,19 @@ def build_default_outlet_analysis_payload(connection: duckdb.DuckDBPyConnection)
                 build_lga_key(normalized_state, normalized_lga)
             )
             category_wards.setdefault(category_label, set()).add(ward_key)
+            raw_category_key = (normalized_outlet_type, category_label)
+            raw_category_counts[raw_category_key] += 1
+            raw_category_states.setdefault(raw_category_key, set()).add(normalized_state)
+            raw_category_lgas.setdefault(raw_category_key, set()).add(
+                build_lga_key(normalized_state, normalized_lga)
+            )
+            raw_category_wards.setdefault(raw_category_key, set()).add(ward_key)
             if visit_status == "Completed":
                 category_completed[category_label] += 1
+                raw_category_completed[raw_category_key] += 1
             elif visit_status == "Observation":
                 category_observation[category_label] += 1
+                raw_category_observation[raw_category_key] += 1
 
         for definition, raw_subcategory_value in zip(OUTLET_SUBCATEGORY_GROUPS, subcategory_values):
             category_name = str(definition["categoryLabel"])
@@ -886,10 +907,19 @@ def build_default_outlet_analysis_payload(connection: duckdb.DuckDBPyConnection)
                     build_lga_key(normalized_state, normalized_lga)
                 )
                 subcategory_wards.setdefault(key, set()).add(ward_key)
+                raw_subcategory_key = (normalized_outlet_type, category_name, proper_label)
+                raw_subcategory_counts[raw_subcategory_key] += 1
+                raw_subcategory_states.setdefault(raw_subcategory_key, set()).add(normalized_state)
+                raw_subcategory_lgas.setdefault(raw_subcategory_key, set()).add(
+                    build_lga_key(normalized_state, normalized_lga)
+                )
+                raw_subcategory_wards.setdefault(raw_subcategory_key, set()).add(ward_key)
                 if visit_status == "Completed":
                     subcategory_completed[key] += 1
+                    raw_subcategory_completed[raw_subcategory_key] += 1
                 elif visit_status == "Observation":
                     subcategory_observation[key] += 1
+                    raw_subcategory_observation[raw_subcategory_key] += 1
 
     outlet_type_rows = []
     for outlet_type_name, record_count in sorted(
@@ -951,6 +981,44 @@ def build_default_outlet_analysis_payload(connection: duckdb.DuckDBPyConnection)
             }
         )
 
+    raw_category_rows = []
+    for (outlet_type_name, category_name), record_count in sorted(
+        raw_category_counts.items(), key=lambda item: (item[0][0], -item[1], item[0][1])
+    ):
+        key = (outlet_type_name, category_name)
+        raw_category_rows.append(
+            {
+                "outletType": outlet_type_name,
+                "categoryName": category_name,
+                "count": int(record_count),
+                "completedCount": int(raw_category_completed.get(key, 0)),
+                "observationCount": int(raw_category_observation.get(key, 0)),
+                "stateCount": len(raw_category_states.get(key, set())),
+                "lgaCount": len(raw_category_lgas.get(key, set())),
+                "wardCount": len(raw_category_wards.get(key, set())),
+            }
+        )
+
+    raw_subcategory_rows = []
+    for (outlet_type_name, category_name, subcategory_name), record_count in sorted(
+        raw_subcategory_counts.items(),
+        key=lambda item: (item[0][0], -item[1], item[0][1], item[0][2]),
+    ):
+        key = (outlet_type_name, category_name, subcategory_name)
+        raw_subcategory_rows.append(
+            {
+                "outletType": outlet_type_name,
+                "categoryName": category_name,
+                "subcategoryName": subcategory_name,
+                "count": int(record_count),
+                "completedCount": int(raw_subcategory_completed.get(key, 0)),
+                "observationCount": int(raw_subcategory_observation.get(key, 0)),
+                "stateCount": len(raw_subcategory_states.get(key, set())),
+                "lgaCount": len(raw_subcategory_lgas.get(key, set())),
+                "wardCount": len(raw_subcategory_wards.get(key, set())),
+            }
+        )
+
     return {
         "stateOptions": state_options,
         "lgaOptions": lga_options,
@@ -960,6 +1028,8 @@ def build_default_outlet_analysis_payload(connection: duckdb.DuckDBPyConnection)
         "outletTypeRows": outlet_type_rows,
         "outletCategoryRows": outlet_category_rows,
         "outletSubcategoryRows": outlet_subcategory_rows,
+        "rawCategoryRows": raw_category_rows,
+        "rawSubcategoryRows": raw_subcategory_rows,
     }
 
 
