@@ -42,6 +42,11 @@ class DashboardStore:
         self._lock = Lock()
         self._cache: dict[str, dict[str, Any]] = {}
 
+    def _prune_cache_locked(self, preferred_dataset_id: str) -> None:
+        for dataset_id in list(self._cache.keys()):
+            if dataset_id != preferred_dataset_id:
+                del self._cache[dataset_id]
+
     def _discover_datasets(self) -> tuple[list[DatasetDescriptor], str]:
         source_paths = builder.discover_duckdb_sources()
         used_ids: set[str] = set()
@@ -158,6 +163,7 @@ class DashboardStore:
         source_token = (stat_result.st_mtime_ns, stat_result.st_size)
 
         with self._lock:
+            self._prune_cache_locked(descriptor.id)
             cached = self._cache.get(descriptor.id)
             if cached and cached["token"] != source_token:
                 cached = None
@@ -174,24 +180,10 @@ class DashboardStore:
             return metrics_payload
 
     def _get_or_build_observations(self, descriptor: DatasetDescriptor) -> dict[str, Any]:
-        stat_result = descriptor.source_path.stat()
-        source_token = (stat_result.st_mtime_ns, stat_result.st_size)
-
-        with self._lock:
-            cached = self._cache.get(descriptor.id)
-            if cached and cached["token"] != source_token:
-                cached = None
-
-            if not cached:
-                cached = {"token": source_token}
-                self._cache[descriptor.id] = cached
-
-            observations_payload = cached.get("observations")
-            if observations_payload is None:
-                observations_payload = self._build_observations_payload(descriptor)
-                cached["observations"] = observations_payload
-
-            return observations_payload
+        # Observation payloads are large enough to push Render over its RAM
+        # limit when kept resident in memory alongside metrics/geometry caches.
+        # Load them on demand instead of retaining them in STORE._cache.
+        return self._build_observations_payload(descriptor)
 
     def _build_metrics_payload(self, descriptor: DatasetDescriptor) -> dict[str, Any]:
         prebuilt_payload = load_prebuilt_metrics_payload(descriptor)
@@ -2220,8 +2212,15 @@ def main() -> None:
     )
     server = ThreadingHTTPServer((host, port), ApiHandler)
     print(f"DuckDB dashboard API listening on http://{host}:{port}")
-    Thread(target=warm_primary_api_cache, daemon=True).start()
-    Thread(target=warm_default_api_caches, daemon=True).start()
+    enable_warmup_env = os.environ.get("DUCKDB_ENABLE_CACHE_WARMUP")
+    running_on_render = bool(os.environ.get("RENDER"))
+    enable_warmup = (
+        enable_warmup_env == "1"
+        if enable_warmup_env is not None
+        else not running_on_render
+    )
+    if enable_warmup:
+        Thread(target=warm_primary_api_cache, daemon=True).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
