@@ -731,7 +731,7 @@ export function deriveFilteredCategoryRows(
 
   // rawCategoryRows is absent in payloads cached before this update — fall back
   // to the pre-aggregated rows so the UI never crashes on stale cache.
-  if (!data.rawCategoryRows) {
+  if (!data.rawCategoryRows || data.rawCategoryRows.length === 0) {
     return data.outletCategoryRows
   }
 
@@ -803,7 +803,7 @@ export function deriveFilteredSubcategoryRows(
 
   // rawSubcategoryRows is absent in payloads cached before this update — fall back
   // to the pre-aggregated rows so the UI never crashes on stale cache.
-  if (!data.rawSubcategoryRows) {
+  if (!data.rawSubcategoryRows || data.rawSubcategoryRows.length === 0) {
     return data.outletSubcategoryRows
   }
 
