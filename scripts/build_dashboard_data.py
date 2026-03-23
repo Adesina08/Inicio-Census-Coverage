@@ -947,6 +947,7 @@ def build_default_outlet_analysis_payload(connection: duckdb.DuckDBPyConnection)
             }
         )
 
+    total_category_count = sum(category_counts.values())
     outlet_category_rows = []
     for category_name, record_count in sorted(category_counts.items(), key=lambda item: (-item[1], item[0])):
         outlet_category_rows.append(
@@ -955,13 +956,14 @@ def build_default_outlet_analysis_payload(connection: duckdb.DuckDBPyConnection)
                 "count": int(record_count),
                 "completedCount": int(category_completed.get(category_name, 0)),
                 "observationCount": int(category_observation.get(category_name, 0)),
-                "sharePercent": 0 if scope_record_count == 0 else (record_count / scope_record_count) * 100,
+                "sharePercent": 0 if total_category_count == 0 else (record_count / total_category_count) * 100,
                 "stateCount": len(category_states.get(category_name, set())),
                 "lgaCount": len(category_lgas.get(category_name, set())),
                 "wardCount": len(category_wards.get(category_name, set())),
             }
         )
 
+    total_subcategory_count = sum(subcategory_counts.values())
     outlet_subcategory_rows = []
     for (category_name, subcategory_name), record_count in sorted(
         subcategory_counts.items(), key=lambda item: (-item[1], item[0][0], item[0][1])
@@ -974,7 +976,7 @@ def build_default_outlet_analysis_payload(connection: duckdb.DuckDBPyConnection)
                 "count": int(record_count),
                 "completedCount": int(subcategory_completed.get(key, 0)),
                 "observationCount": int(subcategory_observation.get(key, 0)),
-                "sharePercent": 0 if scope_record_count == 0 else (record_count / scope_record_count) * 100,
+                "sharePercent": 0 if total_subcategory_count == 0 else (record_count / total_subcategory_count) * 100,
                 "stateCount": len(subcategory_states.get(key, set())),
                 "lgaCount": len(subcategory_lgas.get(key, set())),
                 "wardCount": len(subcategory_wards.get(key, set())),

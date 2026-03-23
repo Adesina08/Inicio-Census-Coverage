@@ -132,6 +132,7 @@ class DashboardStore:
             raise last_error or FileNotFoundError(f"No readable DuckDB sources found in {ROOT}")
 
         manifest = self._dataset_manifest(descriptors, default_dataset_id)
+        metrics_payload = self._load_or_build_metrics_collections(active_descriptor)
 
         response = {
             "datasetOptions": manifest["datasets"],
@@ -141,9 +142,9 @@ class DashboardStore:
                 "sourceFile": active_descriptor.source_file,
                 "generatedAt": payload["summary"].get("generatedAt", ""),
             },
-            "states": payload["states"],
-            "lgas": payload["lgas"],
-            "wards": payload["wards"],
+            "states": metrics_payload["states"],
+            "lgas": metrics_payload["lgas"],
+            "wards": metrics_payload["wards"],
             "observations": empty_feature_collection(),
             "summary": payload["summary"],
         }
@@ -186,30 +187,41 @@ class DashboardStore:
         return self._build_observations_payload(descriptor)
 
     def _build_metrics_payload(self, descriptor: DatasetDescriptor) -> dict[str, Any]:
-        prebuilt_payload = load_prebuilt_metrics_payload(descriptor)
-        if prebuilt_payload is not None:
-            return prebuilt_payload
+        prebuilt_summary = load_prebuilt_summary_payload(descriptor)
+        if prebuilt_summary is not None:
+            return {"summary": prebuilt_summary}
 
         connection = connect_with_runtime_tables(descriptor)
 
         try:
-            state_counts, lga_counts, valid_gps_count = builder.load_observation_admin_counts(
+            summary = builder.build_runtime_dashboard_summary(
+                connection,
+                builder.count_valid_gps_events(connection),
+            )
+
+            return {"summary": summary}
+        finally:
+            connection.close()
+
+    def _load_or_build_metrics_collections(self, descriptor: DatasetDescriptor) -> dict[str, Any]:
+        prebuilt_geometry = load_prebuilt_geometry_payload(descriptor)
+        if prebuilt_geometry is not None:
+            return prebuilt_geometry
+
+        connection = connect_with_runtime_tables(descriptor)
+
+        try:
+            state_counts, lga_counts, _valid_gps_count = builder.load_observation_admin_counts(
                 connection
             )
             states_geojson = builder.transform_state_geojson(state_counts)
             lgas_geojson = builder.transform_lga_geojson(lga_counts)
             coverage_lookup = builder.load_ward_coverage_lookup(connection)
             wards_geojson = builder.transform_ward_geojson_from_lookup(coverage_lookup)
-            summary = builder.build_runtime_dashboard_summary(
-                connection,
-                valid_gps_count,
-            )
-
             return {
                 "states": states_geojson,
                 "lgas": lgas_geojson,
                 "wards": wards_geojson,
-                "summary": summary,
             }
         finally:
             connection.close()
@@ -230,6 +242,7 @@ class DashboardStore:
 STORE = DashboardStore()
 OUTLET_ANALYSIS_CACHE_LOCK = Lock()
 OUTLET_ANALYSIS_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
+_OUTLET_ANALYSIS_CACHE_MAX_ENTRIES = 1
 RUNTIME_TABLE_CONNECTION_LOCK = Lock()
 # Serializes concurrent fetch_outlet_analysis calls per dataset to prevent
 # DuckDB write-write conflicts when multiple requests try to create/modify
@@ -277,6 +290,42 @@ def load_prebuilt_metrics_payload(
             "lgas": json.loads(required_paths["lgas"].read_text(encoding="utf-8")),
             "wards": json.loads(required_paths["wards"].read_text(encoding="utf-8")),
             "summary": json.loads(required_paths["summary"].read_text(encoding="utf-8")),
+        }
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def load_prebuilt_summary_payload(
+    descriptor: DatasetDescriptor,
+) -> dict[str, Any] | None:
+    output_paths = builder.build_dataset_output_paths(descriptor.id)
+    summary_path = output_paths["summary"]
+    if not summary_path.exists():
+        return None
+
+    try:
+        return json.loads(summary_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def load_prebuilt_geometry_payload(
+    descriptor: DatasetDescriptor,
+) -> dict[str, Any] | None:
+    output_paths = builder.build_dataset_output_paths(descriptor.id)
+    required_paths = {
+        "states": output_paths["states"],
+        "lgas": output_paths["lgas"],
+        "wards": output_paths["wards"],
+    }
+    if not all(path.exists() for path in required_paths.values()):
+        return None
+
+    try:
+        return {
+            "states": json.loads(required_paths["states"].read_text(encoding="utf-8")),
+            "lgas": json.loads(required_paths["lgas"].read_text(encoding="utf-8")),
+            "wards": json.loads(required_paths["wards"].read_text(encoding="utf-8")),
         }
     except (OSError, json.JSONDecodeError):
         return None
@@ -718,11 +767,14 @@ def configure_duckdb_connection(
     descriptor: DatasetDescriptor,
 ) -> None:
     temp_directory_text = str(_resolve_duckdb_temp_directory(descriptor))
-
-    memory_limit = os.environ.get("DUCKDB_MEMORY_LIMIT", "256MB")
+    running_on_render = bool(os.environ.get("RENDER"))
+    memory_limit = os.environ.get(
+        "DUCKDB_MEMORY_LIMIT",
+        "128MB" if running_on_render else "256MB",
+    )
     max_temp_directory_size = os.environ.get(
         "DUCKDB_MAX_TEMP_DIRECTORY_SIZE",
-        "10GiB",
+        "2GiB" if running_on_render else "10GiB",
     )
     threads = os.environ.get("DUCKDB_THREADS", "1")
 
@@ -1335,6 +1387,7 @@ def fetch_outlet_analysis(
                     filtered_category_params,
                 ).fetchall()
             ]
+            total_category_count = sum(record_count for _, record_count, *_rest in category_rows)
 
             categories_by_outlet_type: dict[str, list[tuple[str, int]]] = {}
             for outlet_type_name, category_label, record_count in outlet_type_category_rows:
@@ -1384,8 +1437,8 @@ def fetch_outlet_analysis(
                     "observationCount": int(observation_count or 0),
                     "sharePercent": (
                         0
-                        if filtered_record_count == 0
-                        else (int(record_count or 0) / filtered_record_count) * 100
+                        if total_category_count == 0
+                        else (int(record_count or 0) / total_category_count) * 100
                     ),
                     "stateCount": int(state_count or 0),
                     "lgaCount": int(lga_count or 0),
@@ -1419,6 +1472,7 @@ def fetch_outlet_analysis(
                 """,
                 filtered_subcategory_params,
             ).fetchall()
+            total_subcategory_count = sum(record_count or 0 for *_leading, record_count, _completed_count, _observation_count, _state_count, _lga_count, _ward_count in subcategory_rows)
             outlet_subcategory_rows = [
                 {
                     "categoryName": str(category_name),
@@ -1428,8 +1482,8 @@ def fetch_outlet_analysis(
                     "observationCount": int(observation_count or 0),
                     "sharePercent": (
                         0
-                        if filtered_record_count == 0
-                        else (int(record_count or 0) / filtered_record_count) * 100
+                        if total_subcategory_count == 0
+                        else (int(record_count or 0) / total_subcategory_count) * 100
                     ),
                     "stateCount": int(state_count or 0),
                     "lgaCount": int(lga_count or 0),
@@ -1546,6 +1600,8 @@ def fetch_outlet_analysis(
                 "rawSubcategoryRows": raw_subcategory_rows,
             }
             with OUTLET_ANALYSIS_CACHE_LOCK:
+                while len(OUTLET_ANALYSIS_CACHE) >= _OUTLET_ANALYSIS_CACHE_MAX_ENTRIES:
+                    OUTLET_ANALYSIS_CACHE.pop(next(iter(OUTLET_ANALYSIS_CACHE)))
                 OUTLET_ANALYSIS_CACHE[cache_key] = payload
             return payload
         finally:
@@ -2189,15 +2245,6 @@ def warm_primary_api_cache() -> None:
             dataset_id=descriptor.id,
             include_geometry=True,
             include_observations=False,
-        )
-        fetch_outlet_analysis(
-            descriptor,
-            state_name=None,
-            lga_name=None,
-            ward_key=None,
-            category_name=None,
-            outlet_type=None,
-            outlet_types=None,
         )
     except Exception:
         return
