@@ -194,9 +194,10 @@ class DashboardStore:
         connection = connect_with_runtime_tables(descriptor)
 
         try:
+            _, _, valid_gps_count = builder.load_observation_admin_counts(connection)
             summary = builder.build_runtime_dashboard_summary(
                 connection,
-                builder.count_valid_gps_events(connection),
+                valid_gps_count,
             )
 
             return {"summary": summary}
@@ -2153,15 +2154,20 @@ class ApiHandler(BaseHTTPRequestHandler):
         status: HTTPStatus = HTTPStatus.OK,
         cache_control: str = "no-store",
     ) -> None:
-        body = file_path.read_bytes()
         try:
+            file_size = file_path.stat().st_size
             self.send_response(status)
             self._send_default_headers()
             self.send_header("Cache-Control", cache_control)
             self.send_header("Content-Type", content_type)
-            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Content-Length", str(file_size))
             self.end_headers()
-            self.wfile.write(body)
+            with file_path.open("rb") as handle:
+                while True:
+                    chunk = handle.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
         except OSError as error:
             if not is_client_disconnect_error(error):
                 raise

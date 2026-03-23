@@ -268,6 +268,13 @@ async function fetchJson<T>(
 
 const RAW_API_BASE = (import.meta.env.VITE_API_BASE as string | undefined) ?? '/api'
 
+function resolveStaticDataBase() {
+  const baseUrl = (import.meta.env.BASE_URL as string | undefined) ?? '/'
+  const normalizedBase = baseUrl.endsWith('/') ? baseUrl.slice(0, -1) : baseUrl
+  const candidate = `${normalizedBase}/data`
+  return candidate.startsWith('//') ? candidate.slice(1) : candidate || '/data'
+}
+
 function resolveApiBase() {
   if (/^https?:\/\//i.test(RAW_API_BASE)) {
     return RAW_API_BASE.replace(/\/$/, '')
@@ -288,6 +295,7 @@ function resolveApiBase() {
 }
 
 const API_BASE = resolveApiBase()
+const STATIC_DATA_BASE = resolveStaticDataBase()
 const dashboardCache = new Map<string, DashboardData>()
 const analysisObservationCache = new Map<string, ObservationCollection>()
 const mapPointCache = new Map<string, MapPointCollection>()
@@ -439,31 +447,32 @@ export function buildOutletAnalysisCacheKey(params: {
   return searchParams.toString()
 }
 
-// function isDefaultOutletAnalysisScope(params: {
-//   datasetId?: string
-//   stateName?: string
-//   lgaName?: string
-//   wardKey?: string
-//   categoryName?: string
-//   outletType?: string
-//   outletTypes?: readonly string[]
-// }) {
-//   const normalizedOutletTypes = params.outletTypes
-//     ? Array.from(
-//         new Set(params.outletTypes.map((value) => value.trim()).filter((value) => value.length > 0)),
-//       ).sort((first, second) => first.localeCompare(second))
-//     : []
+function isDefaultOutletAnalysisScope(params: {
+  datasetId?: string
+  stateName?: string
+  lgaName?: string
+  wardKey?: string
+  categoryName?: string
+  outletType?: string
+  outletTypes?: readonly string[]
+}) {
+  const normalizedOutletTypes = params.outletTypes
+    ? Array.from(
+        new Set(params.outletTypes.map((value) => value.trim()).filter((value) => value.length > 0)),
+      ).sort((first, second) => first.localeCompare(second))
+    : []
 
-//   return (
-//     (!params.stateName || params.stateName === 'all') &&
-//     (!params.lgaName || params.lgaName === 'all') &&
-//     !params.wardKey &&
-//     (!params.categoryName || params.categoryName === 'all') &&
-//     (!params.outletType || params.outletType === 'all') &&
-//     (normalizedOutletTypes.length === 0 ||
-//       (normalizedOutletTypes.length === 1 && normalizedOutletTypes[0] === 'all'))
-//   )
-// }
+  return (
+    Boolean(params.datasetId) &&
+    (!params.stateName || params.stateName === 'all') &&
+    (!params.lgaName || params.lgaName === 'all') &&
+    !params.wardKey &&
+    (!params.categoryName || params.categoryName === 'all') &&
+    (!params.outletType || params.outletType === 'all') &&
+    (normalizedOutletTypes.length === 0 ||
+      (normalizedOutletTypes.length === 1 && normalizedOutletTypes[0] === 'all'))
+  )
+}
 
 export function peekDashboardData(datasetId?: string): DashboardData | null {
   return dashboardCache.get(resolveDashboardCacheKey(datasetId)) ?? null
@@ -573,28 +582,13 @@ export async function loadAnalysisObservations(params?: {
     searchParams.set('wardKey', params.wardKey)
   }
 
-  const hasScopeFilter =
-    (params?.stateName && params.stateName !== 'all') ||
-    (params?.lgaName && params.lgaName !== 'all') ||
-    Boolean(params?.wardKey)
-
-  if (!hasScopeFilter) {
-    const search = params?.datasetId ? `?dataset=${encodeURIComponent(params.datasetId)}` : ''
-    const separator = search ? '&' : '?'
-    const payload = await fetchJson<DashboardResponse>(
-      `${API_BASE}/dashboard${search}${separator}includeGeometry=0&includeObservations=1`,
-      { timeoutMs: 180000 },
-    )
-
-    analysisObservationCache.set(payload.activeDataset.id, payload.observations)
-    analysisObservationCache.set(cacheKey, payload.observations)
-    return payload.observations
-  }
-
   const collection = await fetchJson<ObservationCollection>(
     `${API_BASE}/analysis-observations?${searchParams.toString()}`,
     { timeoutMs: 180000 },
   )
+  if (params?.datasetId && (!params.stateName || params.stateName === 'all') && (!params.lgaName || params.lgaName === 'all') && !params.wardKey) {
+    analysisObservationCache.set(params.datasetId, collection)
+  }
   analysisObservationCache.set(cacheKey, collection)
   return collection
 }
@@ -660,9 +654,12 @@ export async function loadOutletAnalysis(params: {
     return existingRequest
   }
 
-  const query = cacheKey ? `?${cacheKey}` : ''
+  const requestPath = isDefaultOutletAnalysisScope(params)
+    ? `${STATIC_DATA_BASE}/${encodeURIComponent(params.datasetId!)}/outlet-analysis.json`
+    : `${API_BASE}/outlet-analysis${cacheKey ? `?${cacheKey}` : ''}`
+
   const request = fetchJson<OutletAnalysisData>(
-    `${API_BASE}/outlet-analysis${query}`,
+    requestPath,
     { timeoutMs: 60000 },
   ).then((payload) => {
     // Normalise payloads from older server builds that predate rawCategoryRows /

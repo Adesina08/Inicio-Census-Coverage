@@ -834,15 +834,6 @@ export default function App() {
           setLoadingProgressTarget(88)
         }
 
-        const [nextAnalysis, nextOutletAnalysis] = await Promise.all([
-          cachedAnalysis ?? loadAnalysisObservations({ datasetId: requestedDatasetId }),
-          cachedOutletAnalysis ?? loadOutletAnalysis({ datasetId: requestedDatasetId }),
-        ])
-
-        if (ignore) {
-          return
-        }
-
         setLoadingProgressTarget(100)
         setLoadingPhaseLabel('Finalizing workspace.')
         await new Promise((resolve) => window.setTimeout(resolve, 120))
@@ -852,19 +843,25 @@ export default function App() {
         }
 
         startTransition(() => {
-          setAnalysisObservations(nextAnalysis.features)
+          if (cachedAnalysis) {
+            setAnalysisObservations(cachedAnalysis.features)
+          }
           if (
+            cachedOutletAnalysis &&
             hasDefaultOutletAnalysisScope(outletAnalysisScopeRef.current) &&
             outletAnalysisRequestKeyRef.current === defaultOutletScopeKey
           ) {
-            setOutletAnalysis(nextOutletAnalysis)
+            setOutletAnalysis(cachedOutletAnalysis)
           }
           setLoadError(null)
           setIsDatasetLoading(false)
-          setIsAnalysisLoading(false)
-          setIsOutletAnalysisLoading(false)
+          setIsAnalysisLoading(cachedAnalysis == null)
+          setIsOutletAnalysisLoading(cachedOutletAnalysis == null)
+          setShouldLoadBoundaryAnalysis(true)
+          setShouldLoadOutletAnalysis(true)
         })
         setIsStartupReady(true)
+        return
       } catch (error: unknown) {
         if (ignore) {
           return
@@ -1069,7 +1066,7 @@ export default function App() {
   ])
 
   useEffect(() => {
-    if (!dashboard || isDatasetLoading) {
+    if (!dashboard || isDatasetLoading || shouldLoadBoundaryAnalysis || shouldLoadOutletAnalysis) {
       return
     }
 
@@ -1145,7 +1142,7 @@ export default function App() {
       cancelled = true
       window.clearTimeout(timeoutId)
     }
-  }, [dashboard?.activeDataset.id])
+  }, [dashboard?.activeDataset.id, isDatasetLoading, shouldLoadBoundaryAnalysis, shouldLoadOutletAnalysis])
 
   useEffect(() => {
     if (!dashboard) {
